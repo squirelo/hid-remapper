@@ -8,6 +8,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/drivers/gpio.h>
@@ -796,7 +797,42 @@ static void usb_init() {
     CHK(usb_enable(status_cb));
 }
 
-static void bt_init() {
+
+static void bt_ready(int err)
+{
+    if (err) {
+        printk("Bluetooth init failed (err %d)\n", err);
+        return;
+    }
+
+    printk("Bluetooth initialized\n");
+
+    const char *device_name = "HID Remapper Bluetooth";
+    bt_set_name(device_name);
+
+    struct bt_le_adv_param adv_param = {
+        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer = NULL,
+    };
+
+    const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, device_name, strlen(device_name)),
+    };
+
+    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        printk("Advertising failed to start (err %d)\n", err);
+        return;
+    }
+
+    printk("Advertising successfully started\n");
+}
+
+static void bt_init()
+{
     for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
         bt_hogp_init(&hogps[i], &hogp_init_params);
     }
@@ -809,9 +845,8 @@ static void bt_init() {
         return;
     }
 
-    CHK(bt_enable(NULL));
+    CHK(bt_enable(bt_ready));  // Initialize Bluetooth and call bt_ready when done
 }
-
 static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
     LOG_INF("len=%d", len);
 
