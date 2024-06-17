@@ -8,3 +8,53 @@ config BOARD_ENABLE_DCDC
 	select SOC_DCDC_NRF52X
 	default y
 	depends on BOARD_SEEED_XIAO_NRF52840
+
+menu "Bluetooth"
+
+config BT
+    bool "Bluetooth support"
+    default y
+    select BT_HCI
+    select BT_CONN
+    select BT_HCI_HOST
+    select BT_L2CAP
+    select BT_ATT
+    select BT_GATT
+    select BT_SMP
+
+config BT_GATT
+    bool "GATT Services"
+    depends on BT
+    default y
+
+config BT_GATT_SERVER
+    bool "GATT Server"
+    depends on BT_GATT
+    default y
+
+config BT_HID
+    bool "HID over GATT"
+    depends on BT_GATT
+    default y
+
+config BT_HIDS
+    bool "HID Service"
+    depends on BT_HID
+    default y
+
+config BT_DIS
+    bool "Device Information Service"
+    depends on BT
+    default y
+
+config BT_DIS_MODEL
+    string "Model Name"
+    depends on BT_DIS
+    default "HID Remapper"
+
+config BT_DIS_MANUFACTURER
+    string "Manufacturer Name"
+    depends on BT_DIS
+    default "Your Manufacturer"
+
+endmenu
