@@ -4,10 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_ENABLE_DCDC
-	bool "DCDC mode"
-	select SOC_DCDC_NRF52X
-	default y
-	depends on BOARD_SEEED_XIAO_NRF52840
+    bool "DCDC mode"
+    select SOC_DCDC_NRF52X
+    default y
+    depends on BOARD_SEEED_XIAO_NRF52840
 
 menu "Bluetooth"
 
@@ -20,17 +20,6 @@ config BT
     select BT_ATT
     select BT_GATT
     select BT_SMP
-
-choice BT_HCI_CHOICE
-    prompt "Bluetooth HCI driver"
-    default BT_HCI_DRIVER
-
-config BT_HCI_DRIVER
-    bool "HCI driver"
-    depends on BT
-    default y
-
-endchoice
 
 config BT_GATT
     bool "GATT Services"
