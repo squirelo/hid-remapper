@@ -1,9 +1,9 @@
+
 #include <errno.h>
 #include <stddef.h>
 
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
-#include <bluetooth/services/hids.h>
 #include <bluetooth/services/hogp.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -20,8 +20,6 @@
 #include <zephyr/types.h>
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/usb/usb_device.h>
-#include <zephyr/drivers/uart.h>
-
 
 #include "config.h"
 #include "descriptor_parser.h"
@@ -49,77 +47,8 @@ static K_SEM_DEFINE(usb_sem1, 1, 1);
 
 static struct k_mutex mutexes[(uint8_t) MutexId::N];
 
-
-// try to add hid uart device !
-
 static const struct device* hid_dev0;
 static const struct device* hid_dev1;  // config interface
-
-static const uint8_t hid_report_map[] = {
-    // Define your HID report map here
-};
-
-BT_HIDS_DEF(hids_obj,
-    // Add your HID service parameters here
-);
-
-
-static void hid_init(void)
-{
-    int err;
-
-    struct bt_hids_init_param hids_init = {
-        .rep_map.data = hid_report_map,
-        .rep_map.size = sizeof(hid_report_map),
-        // Add additional initialization parameters here
-    };
-
-    err = bt_hids_init(&hids_obj, &hids_init);
-    if (err) {
-        LOG_ERR("HID service initialization failed (err %d)", err);
-        return;
-    }
-
-    LOG_INF("HID service initialized");
-}
-
-static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
-{
-    switch (evt->type) {
-    case UART_TX_DONE:
-        // Handle UART TX complete
-        break;
-    case UART_RX_RDY:
-        // Handle received UART data
-        // You can process the data here or send it over BLE HID
-        break;
-    case UART_ERROR:
-        // Handle UART error
-        break;
-    default:
-        break;
-    }
-}
-
-static void uart_init(void)
-{
-    const struct device *uart_dev = device_get_binding("UART_0");
-    if (!uart_dev) {
-        LOG_ERR("UART device not found");
-        return;
-    }
-
-    uart_callback_set(uart_dev, uart_cb, NULL);
-
-    int err = uart_rx_enable(uart_dev, uart_rx_buf, sizeof(uart_rx_buf), 50);
-    if (err) {
-        LOG_ERR("Failed to enable UART RX (err %d)", err);
-        return;
-    }
-
-    LOG_INF("UART initialized");
-}
-
 
 struct report_type {
     uint8_t conn_idx;
@@ -938,8 +867,6 @@ int main() {
     scan_init();
     parse_our_descriptor();
     set_mapping_from_config();
-        hid_init(); // Initialize HID service
-    uart_init(); // Initialize UART
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 
