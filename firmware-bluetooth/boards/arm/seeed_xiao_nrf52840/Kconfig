@@ -14,13 +14,23 @@ menu "Bluetooth"
 config BT
     bool "Bluetooth support"
     default y
-    select BT_HCI
     select BT_CONN
     select BT_HCI_HOST
     select BT_L2CAP
     select BT_ATT
     select BT_GATT
     select BT_SMP
+
+choice BT_HCI_CHOICE
+    prompt "Bluetooth HCI driver"
+    default BT_HCI_DRIVER
+
+config BT_HCI_DRIVER
+    bool "HCI driver"
+    depends on BT
+    default y
+
+endchoice
 
 config BT_GATT
     bool "GATT Services"
