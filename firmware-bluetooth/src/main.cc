@@ -50,7 +50,7 @@ static K_SEM_DEFINE(usb_sem1, 1, 1);
 static struct k_mutex mutexes[(uint8_t) MutexId::N];
 
 
-// try to add hid uart device 
+// try to add hid uart device !
 
 static const struct device* hid_dev0;
 static const struct device* hid_dev1;  // config interface
