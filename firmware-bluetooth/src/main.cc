@@ -20,6 +20,9 @@
 #include <zephyr/types.h>
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/console/console.h>
+
 
 #include "config.h"
 #include "descriptor_parser.h"
@@ -49,6 +52,14 @@ static struct k_mutex mutexes[(uint8_t) MutexId::N];
 
 static const struct device* hid_dev0;
 static const struct device* hid_dev1;  // config interface
+
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_console)
+#define UART_BUFFER_SIZE 64
+
+static const struct device *uart_dev;
+static uint8_t uart_buffer[UART_BUFFER_SIZE];
+static size_t uart_buffer_pos;
+
 
 struct report_type {
     uint8_t conn_idx;
@@ -300,6 +311,19 @@ static void scan_filter_no_match(struct bt_scan_device_info* device_info, bool c
         }
     }
 }
+
+static void uart_init(void) {
+    uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+
+    if (!device_is_ready(uart_dev)) {
+        printk("UART device not ready\n");
+        return;
+    }
+
+    uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
+    uart_irq_rx_enable(uart_dev);
+}
+
 
 BT_SCAN_CB_INIT(scan_cb, scan_filter_match, scan_filter_no_match, scan_connecting_error, scan_connecting);
 
@@ -641,6 +665,29 @@ static int get_report_cb(const struct device* dev, struct usb_setup_packet* setu
     return 0;
 };
 
+static void uart_cb(const struct device *dev, void *user_data) {
+    uint8_t data;
+    while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+        if (uart_irq_rx_ready(dev)) {
+            uart_fifo_read(dev, &data, 1);
+            uart_buffer[uart_buffer_pos++] = data;
+
+            if (uart_buffer_pos == UART_BUFFER_SIZE || data == '\n') {
+                uart_buffer[uart_buffer_pos] = '\0';
+                process_uart_data(uart_buffer, uart_buffer_pos);
+                uart_buffer_pos = 0;
+            }
+        }
+    }
+}
+static void process_uart_data(uint8_t *data, size_t len) {
+    // Process the data received from UART
+    // For example, print it to the console or parse commands
+    printk("Received data: %s\n", data);
+
+    // Add your specific data handling code here
+}
+
 static void int_in_ready_cb0(const struct device* dev) {
     k_sem_give(&usb_sem0);
 }
@@ -867,6 +914,8 @@ int main() {
     scan_init();
     parse_our_descriptor();
     set_mapping_from_config();
+    
+    uart_init();
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 
