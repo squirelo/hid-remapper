@@ -1,12 +1,11 @@
+
 #include <errno.h>
 #include <stddef.h>
 
-#include <bluetooth/gatt_dm.h>
-#include <bluetooth/scan.h>
-#include <bluetooth/services/hogp.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/drivers/gpio.h>
@@ -19,6 +18,9 @@
 #include <zephyr/types.h>
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/console/console.h>
+
 
 #include "config.h"
 #include "descriptor_parser.h"
@@ -39,15 +41,12 @@ static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HI
 static auto BT_ADDR_LE_ANY_ = BT_ADDR_LE_ANY[0];
 static auto BT_CONN_LE_CREATE_CONN_ = BT_CONN_LE_CREATE_CONN[0];
 
-static struct bt_hogp hogps[CONFIG_BT_MAX_CONN];
+static struct bt_uuid_128 gamepad_service_uuid = BT_UUID_INIT_128(GAMEPAD_SERVICE_UUID);
+static struct bt_uuid_128 gamepad_char_uuid = BT_UUID_INIT_128(GAMEPAD_CHARACTERISTIC_UUID);
 
-static K_SEM_DEFINE(usb_sem0, 1, 1);
-static K_SEM_DEFINE(usb_sem1, 1, 1);
-
-static struct k_mutex mutexes[(uint8_t) MutexId::N];
-
-static const struct device* hid_dev0;
-static const struct device* hid_dev1;  // config interface
+static struct bt_gatt_service gamepad_svc;
+static struct bt_gatt_chr_def gamepad_chars[2];
+static struct bt_gatt_service_static gamepad_service;
 
 struct report_type {
     uint8_t conn_idx;
@@ -97,10 +96,78 @@ static struct gpio_callback button_cb_data;
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 
-static bool scanning = false;
-static bool peers_only = true;
+static K_SEM_DEFINE(usb_sem0, 1, 1);
+static K_SEM_DEFINE(usb_sem1, 1, 1);
+static K_SEM_DEFINE(usb_sem_gamepad, 1, 1);
 
-static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
+static struct k_mutex mutexes[(uint8_t) MutexId::N];
+
+static const struct device* hid_dev0;
+static const struct device* hid_dev1;  // config interface
+static const struct device* hid_dev_gamepad;  // gamepad interface
+
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_console)
+#define UART_BUFFER_SIZE 64
+
+static const struct device *uart_dev;
+static uint8_t uart_buffer[UART_BUFFER_SIZE];
+static size_t uart_buffer_pos;
+
+struct gamepad_report {
+    int8_t x;
+    int8_t y;
+    int8_t z;
+    int8_t rz;
+    int8_t rx;
+    int8_t ry;
+    uint8_t hat;
+    uint32_t buttons;
+} __packed;
+
+static struct gamepad_report gp_report;
+
+static ssize_t write_gamepad(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+    if (offset + len > sizeof(gp_report)) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    }
+
+    memcpy(((uint8_t *)&gp_report) + offset, buf, len);
+    
+    // Send the updated gamepad report over USB
+    send_gamepad_report(hid_dev_gamepad);
+
+    return len;
+}
+
+static void send_gamepad_report(const struct device *dev) {
+    if (k_sem_take(&usb_sem_gamepad, K_NO_WAIT) == 0) {
+        hid_int_ep_write(dev, (uint8_t *)&gp_report, sizeof(gp_report), NULL);
+    }
+}
+
+static void gamepad_service_init(void)
+{
+    gamepad_chars[0] = (struct bt_gatt_chr_def) {
+        .uuid = &gamepad_char_uuid.uuid,
+        .props = BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+        .write = write_gamepad,
+    };
+
+    gamepad_chars[1] = (struct bt_gatt_chr_def) { 0 };
+
+    gamepad_service = (struct bt_gatt_service_static) {
+        .attrs = (struct bt_gatt_attr[]) {
+            BT_GATT_PRIMARY_SERVICE(&gamepad_service_uuid),
+            BT_GATT_CHARACTERISTIC(gamepad_chars),
+            BT_GATT_DESCRIPTOR(&gamepad_char_uuid, BT_GATT_PERM_WRITE, NULL, write_gamepad, NULL),
+        },
+        .attr_count = 3,
+    };
+
+    bt_gatt_service_register(&gamepad_service);
+}
 
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
@@ -160,265 +227,36 @@ static void set_led_mode(LedMode led_mode_) {
     }
 }
 
-static void scan_start() {
-    if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE))) {
-        LOG_DBG("Scanning started.");
-        scanning = true;
-    }
-}
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+    char addr[BT_ADDR_LE_STR_LEN];
 
-static void scan_stop() {
-    if (CHK(bt_scan_stop())) {
-        LOG_DBG("Scanning stopped.");
-        scanning = false;
-        set_led_mode(LedMode::BLINK);
-    }
-}
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-static void process_bond(const struct bt_bond_info* info, void* user_data) {
-    char addr_str[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(&info->addr, addr_str, sizeof(addr_str));
-    LOG_DBG("%s", addr_str);
-    (*((int*) user_data))++;
-    CHK(bt_scan_filter_add(BT_SCAN_FILTER_TYPE_ADDR, &info->addr));
-}
-
-static void count_conn_cb(struct bt_conn* conn, void* data) {
-    (*((int*) data))++;
-}
-
-static int count_connections() {
-    int conn_count = 0;
-    bt_conn_foreach(BT_CONN_TYPE_LE, count_conn_cb, &conn_count);
-    atomic_set(&led_blink_count, conn_count);
-    return conn_count;
-}
-
-static bool scan_setup_filters() {
-    bt_scan_filter_remove_all();
-
-    if (!CHK(bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, (struct bt_uuid*) &BT_UUID_HIDS_))) {
-        return false;
-    }
-
-    int bonded_count = 0;
-    bt_foreach_bond(BT_ID_DEFAULT, process_bond, &bonded_count);
-
-    int conn_count = count_connections();
-
-    uint8_t filter_mode = BT_SCAN_UUID_FILTER;
-
-    if (peers_only && (bonded_count > 0)) {
-        if (conn_count == bonded_count) {
-            LOG_DBG("all bonded peers connected, not scanning");
-            return false;
-        }
-        filter_mode |= BT_SCAN_ADDR_FILTER;
-        LOG_DBG("scanning for bonded peers only");
-    } else {
-        LOG_DBG("scanning for new peers");
-        peers_only = false;
-    }
-
-    if (!CHK(bt_scan_filter_enable(filter_mode, true))) {
-        return false;
-    }
-
-    return true;
-}
-
-static void scan_start_work_fn(struct k_work* work) {
-    if (scanning) {
-        scan_stop();
-    }
-    if (scan_setup_filters()) {
-        scan_start();
-        set_led_mode(peers_only ? LedMode::BLINK : LedMode::ON);
-    } else {
-        set_led_mode(LedMode::BLINK);
-    }
-}
-static K_WORK_DELAYABLE_DEFINE(scan_start_work, scan_start_work_fn);
-
-static void scan_stop_work_fn(struct k_work* work) {
-    scan_stop();
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-}
-static K_WORK_DEFINE(scan_stop_work, scan_stop_work_fn);
-
-static void disconnect_conn(struct bt_conn* conn, void* data) {
-    CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
-}
-
-static void clear_bonds_work_fn(struct k_work* work) {
-    if (CHK(bt_unpair(BT_ID_DEFAULT, &BT_ADDR_LE_ANY_))) {
-        LOG_INF("Bonds cleared.");
-    } else {
+    if (err) {
+        LOG_ERR("Failed to connect to %s (%u)", addr, err);
         return;
     }
 
-    scan_stop();
-    bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    LOG_INF("Connected: %s", addr);
+    set_led_mode(LedMode::ON);
 }
-static K_WORK_DEFINE(clear_bonds_work, clear_bonds_work_fn);
 
-static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt_scan_filter_match* filter_match, bool connectable) {
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
     char addr[BT_ADDR_LE_STR_LEN];
 
-    if (!filter_match->uuid.match || (filter_match->uuid.count != 1)) {
-        LOG_WRN("%s invalid device connected", __func__);
-        return;
-    }
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
+    LOG_INF("Disconnected: %s (reason %u)", addr, reason);
 
-    LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
-}
-
-static void scan_connecting_error(struct bt_scan_device_info* device_info) {
-    LOG_WRN("");
-}
-
-static void scan_connecting(struct bt_scan_device_info* device_info, struct bt_conn* conn) {
-    LOG_INF("");
-}
-
-// XXX this hasn't been tested in practice
-static void scan_filter_no_match(struct bt_scan_device_info* device_info, bool connectable) {
-    struct bt_conn* conn;
-    char addr[BT_ADDR_LE_STR_LEN];
-
-    if (device_info->recv_info->adv_type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
-        bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
-        LOG_INF("Direct advertising received from %s", addr);
-        scan_stop();  // XXX
-
-        if (CHK(bt_conn_le_create(device_info->recv_info->addr, &BT_CONN_LE_CREATE_CONN_, device_info->conn_param, &conn))) {
-            bt_conn_unref(conn);
-        }
-    }
-}
-
-BT_SCAN_CB_INIT(scan_cb, scan_filter_match, scan_filter_no_match, scan_connecting_error, scan_connecting);
-
-// This is a workaround for the Xbox Adaptive Controller that sends UUIDs like this:
-// 00002a4a-0000-0000-0000-000000000000 in Find Information responses.
-// This is not the correct UUID128 representation for UUID16(2a4a), which would be:
-// 00002a4a-0000-1000-8000-00805f9b34fb
-static void patch_broken_uuids(struct bt_gatt_dm* dm) {
-    const struct bt_gatt_dm_attr* attr = NULL;
-    char str1[BT_UUID_STR_LEN];
-    char str2[BT_UUID_STR_LEN];
-
-    while (NULL != (attr = bt_gatt_dm_attr_next(dm, attr))) {
-        if (attr->uuid->type == BT_UUID_TYPE_128) {
-            bool needs_fix = true;
-            for (int i = 0; i < 16; i++) {
-                if ((i != 12) && (i != 13) && (BT_UUID_128(attr->uuid)->val[i] != 0)) {
-                    needs_fix = false;
-                    break;
-                }
-            }
-            if (needs_fix) {
-                bt_uuid_to_str(attr->uuid, str1, sizeof(str2));
-                *((bt_uuid_16*) attr->uuid) = {
-                    .uuid = { BT_UUID_TYPE_16 },
-                    .val = (BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
-                };
-                bt_uuid_to_str(attr->uuid, str2, sizeof(str2));
-                LOG_INF("%s -> %s", str1, str2);
-            }
-        }
-    }
-}
-
-static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
-    LOG_INF("");
-    patch_broken_uuids(dm);
-    CHK(bt_hogp_handles_assign(dm, ((struct bt_hogp*) context)));  // XXX disconnect if this fails?
-    CHK(bt_gatt_dm_data_release(dm));
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-}
-
-static void discovery_service_not_found_cb(struct bt_conn* conn, void* context) {
-    LOG_WRN("");
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-}
-
-static void discovery_error_found_cb(struct bt_conn* conn, int err, void* context) {
-    LOG_ERR("err=%d", err);
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-}
-
-static const struct bt_gatt_dm_cb discovery_cb = {
-    .completed = discovery_completed_cb,
-    .service_not_found = discovery_service_not_found_cb,
-    .error_found = discovery_error_found_cb,
-};
-
-static void gatt_discover(struct bt_conn* conn) {
-    uint8_t conn_idx = bt_conn_index(conn);
-    if (!CHK(bt_gatt_dm_start(conn, (struct bt_uuid*) &BT_UUID_HIDS_, &discovery_cb, &hogps[conn_idx]))) {
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-    }
-}
-
-static int64_t button_pressed_at;
-
-static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32_t pins) {
-    int button_state = gpio_pin_get(dev, button.pin);
-    if (button_state) {
-        button_pressed_at = k_uptime_get();
-    } else {
-        if (k_uptime_get() - button_pressed_at > CLEAR_BONDS_BUTTON_PRESS_MS) {
-            clear_bonds();
-        } else {
-            pair_new_device();
-        }
-    }
-}
-
-static void connected(struct bt_conn* conn, uint8_t conn_err) {
-    char addr[BT_ADDR_LE_STR_LEN];
-
-    scanning = false;
-    count_connections();
     set_led_mode(LedMode::BLINK);
 
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-    if (conn_err) {
-        LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-
-        return;
+    // Restart advertising
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
     }
-
-    LOG_INF("%s", addr);
-
-    CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
-}
-
-static void disconnected(struct bt_conn* conn, uint8_t reason) {
-    char addr[BT_ADDR_LE_STR_LEN];
-
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-    LOG_INF("%s (reason=%u)", addr, reason);
-
-    uint8_t conn_idx = bt_conn_index(conn);
-
-    if (bt_hogp_assign_check(&hogps[conn_idx])) {
-        bt_hogp_release(&hogps[conn_idx]);
-    }
-
-    struct disconnected_type disconnected_item = { .conn_idx = conn_idx };
-    CHK(k_msgq_put(&disconnected_q, &disconnected_item, K_NO_WAIT));
-
-    count_connections();
-
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
@@ -428,8 +266,6 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
 
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
-        peers_only = true;
-        gatt_discover(conn);
     } else {
         LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
     }
@@ -453,152 +289,56 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .security_changed = security_changed,
 };
 
-static void scan_init() {
-    struct bt_scan_init_param scan_init = {
-        .scan_param = NULL,
-        .connect_if_match = 1,
-        .conn_param = conn_param,
-    };
-
-    bt_scan_init(&scan_init);
-    bt_scan_cb_register(&scan_cb);
-}
-
-static int8_t hogp_index(struct bt_hogp* hogp) {
-    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-        if (&hogps[i] == hogp) {
-            return i;
-        }
-    }
-
-    LOG_ERR("unknown hogp!");
-    return -1;
-}
-
-static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
-    k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // XXX what if work_fn is currently running? it might turn the led off after we turn it on
-    gpio_pin_set_dt(&led0, true);
-
-    if (!data) {
-        return BT_GATT_ITER_STOP;
-    }
-
-    if (scanning) {
-        scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
-        k_work_submit(&scan_stop_work);
-    } else {
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-    }
-
-    static struct report_type buf;
-    buf.conn_idx = hogp_index(hogp);
-    buf.len = bt_hogp_rep_size(rep) + 1;
-    buf.data[0] = bt_hogp_rep_id(rep);
-
-    memcpy(buf.data + 1, data, buf.len);
-    if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
-        //        printk("error in k_msg_put(report_q\n");
-    }
-
-    return BT_GATT_ITER_CONTINUE;
-}
-
-// XXX is this ready for simultaneous connection setup? is discovery ready? do we care?
-static struct descriptor_type their_descriptor;
-
-static void hogp_map_read_cb(struct bt_hogp* hogp, uint8_t err, const uint8_t* data, size_t size, size_t offset) {
-    if (data == NULL) {
-        their_descriptor.size = offset;
-        their_descriptor.conn_idx = hogp_index(hogp);
-        CHK(k_msgq_put(&descriptor_q, &their_descriptor, K_NO_WAIT));
+static void bt_ready(int err)
+{
+    if (err) {
+        LOG_ERR("Bluetooth init failed (err %d)", err);
         return;
     }
 
-    memcpy(their_descriptor.data + offset, data, size);
+    LOG_INF("Bluetooth initialized");
 
-    bt_hogp_map_read(hogp, hogp_map_read_cb, offset + size, K_NO_WAIT);
+    gamepad_service_init();
+
+    // Prepare advertising data
+    static const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+        BT_DATA_BYTES(BT_DATA_UUID128_ALL, GAMEPAD_SERVICE_UUID),
+    };
+
+    // Start advertising
+    err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+        return;
+    }
+
+    LOG_INF("Advertising successfully started");
+    set_led_mode(LedMode::BLINK);
 }
 
-struct find_bond_t {
-    bt_addr_le_t addr;
-    uint8_t i;
-    uint8_t found_idx;
-};
-
-static void find_bond_cb(const struct bt_bond_info* info, void* user_data) {
-    struct find_bond_t* find_bond = (struct find_bond_t*) user_data;
-    find_bond->i++;
-    if (bt_addr_le_eq(&find_bond->addr, &info->addr)) {
-        find_bond->found_idx = find_bond->i;
+static void bt_init()
+{
+    if (!CHK(bt_enable(bt_ready))) {
+        return;
     }
 }
 
-static void hogp_ready_work_fn(struct k_work* work) {
-    struct bt_hogp_rep_info* rep = NULL;
-    struct hogp_ready_type item;
+static int64_t button_pressed_at;
 
-    while (!k_msgq_get(&hogp_ready_q, &item, K_NO_WAIT)) {
-        LOG_INF("hogp_ready");
-
-        struct find_bond_t find_bond = { .i = 0, .found_idx = 0, };
-        bt_addr_le_copy(&find_bond.addr, bt_conn_get_dst(bt_hogp_conn(item.hogp)));
-        bt_foreach_bond(BT_ID_DEFAULT, find_bond_cb, &find_bond);
-        LOG_DBG("found bond idx: %d", find_bond.found_idx);
-        device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
-
-        while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
-            if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
-                LOG_DBG("subscribing to report ID: %u", bt_hogp_rep_id(rep));
-                CHK(bt_hogp_rep_subscribe(item.hogp, rep, hogp_notify_cb));
-            }
+static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32_t pins) {
+    int button_state = gpio_pin_get(dev, button.pin);
+    if (button_state) {
+        button_pressed_at = k_uptime_get();
+    } else {
+        if (k_uptime_get() - button_pressed_at > CLEAR_BONDS_BUTTON_PRESS_MS) {
+            clear_bonds();
+        } else {
+            pair_new_device();
         }
-
-        bt_hogp_map_read(item.hogp, hogp_map_read_cb, 0, K_NO_WAIT);
     }
 }
-static K_WORK_DEFINE(hogp_ready_work, hogp_ready_work_fn);
-
-static void hogp_ready_cb(struct bt_hogp* hogp) {
-    struct hogp_ready_type q_item = { .hogp = hogp };
-    CHK(k_msgq_put(&hogp_ready_q, &q_item, K_NO_WAIT));
-    k_work_submit(&hogp_ready_work);
-}
-
-static void hogp_prep_error_cb(struct bt_hogp* hogp, int err) {
-    LOG_ERR("err=%d", err);
-}
-
-static const struct bt_hogp_init_params hogp_init_params = {
-    .ready_cb = hogp_ready_cb,
-    .prep_error_cb = hogp_prep_error_cb,
-};
-
-static void auth_cancel(struct bt_conn* conn) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_WRN("%s", addr);
-}
-
-static void pairing_complete(struct bt_conn* conn, bool bonded) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_INF("%s, bonded=%d", addr, bonded);
-}
-
-static void pairing_failed(struct bt_conn* conn, enum bt_security_err reason) {
-    char addr[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-    LOG_ERR("%s, reason %d", addr, reason);
-}
-
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-    .cancel = auth_cancel,
-};
-
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
-    .pairing_complete = pairing_complete,
-    .pairing_failed = pairing_failed
-};
 
 static int set_report_cb(const struct device* dev, struct usb_setup_packet* setup, int32_t* len, uint8_t** data) {
     uint8_t request_value[2];
@@ -639,6 +379,44 @@ static int get_report_cb(const struct device* dev, struct usb_setup_packet* setu
 
     return 0;
 };
+static void uart_cb(const struct device *dev, void *user_data);
+static void process_uart_data(uint8_t *data, size_t len);
+
+static void uart_cb(const struct device *dev, void *user_data) {
+    uint8_t data;
+    while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+        if (uart_irq_rx_ready(dev)) {
+            uart_fifo_read(dev, &data, 1);
+            uart_buffer[uart_buffer_pos++] = data;
+
+            if (uart_buffer_pos == UART_BUFFER_SIZE || data == '\n') {
+                uart_buffer[uart_buffer_pos] = '\0';
+                process_uart_data(uart_buffer, uart_buffer_pos);
+                uart_buffer_pos = 0;
+            }
+        }
+    }
+}
+
+static void process_uart_data(uint8_t *data, size_t len) {
+    // Process the data received from UART
+    // For example, print it to the console or parse commands
+    printk("Received data: %s\n", data);
+
+    // Add your specific data handling code here
+}
+
+static void uart_init(void) {
+    uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+
+    if (!device_is_ready(uart_dev)) {
+        printk("UART device not ready\n");
+        return;
+    }
+
+    uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
+    uart_irq_rx_enable(uart_dev);
+}
 
 static void int_in_ready_cb0(const struct device* dev) {
     k_sem_give(&usb_sem0);
@@ -737,29 +515,109 @@ static void usb_init() {
         return;
     }
 
+    hid_dev_gamepad = device_get_binding("HID_2");
+    if (hid_dev_gamepad == NULL) {
+        LOG_ERR("Cannot get USB HID Device for Gamepad.");
+        return;
+    }
+
     usb_hid_register_device(hid_dev0, our_descriptor->descriptor, our_descriptor->descriptor_length, &ops0);
     usb_hid_register_device(hid_dev1, config_report_descriptor, config_report_descriptor_length, &ops1);
+    usb_hid_register_device(hid_dev_gamepad, hid_gamepad_report_desc, sizeof(hid_gamepad_report_desc), &ops_gamepad);
+
     CHK(usb_hid_init(hid_dev0));
     CHK(usb_hid_init(hid_dev1));
+    CHK(usb_hid_init(hid_dev_gamepad));
+
     CHK(usb_enable(status_cb));
 }
 
-static void bt_init() {
-    for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-        bt_hogp_init(&hogps[i], &hogp_init_params);
+int main(void)
+{
+    LOG_INF("Starting Bluetooth Gamepad Peripheral");
+
+    my_mutexes_init();
+    button_init();
+    leds_init();
+    CHK(settings_subsys_init());
+    CHK(settings_register(&our_settings_handlers));
+    settings_load();
+    descriptor_init();
+    usb_init();
+    bt_init();
+    uart_init();
+
+    while (true) {
+        // Handle Bluetooth reports
+        struct report_type incoming_report;
+        while (!k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
+            // Update the gamepad report with the received data
+            memcpy(&gp_report, incoming_report.data, MIN(sizeof(gp_report), incoming_report.len));
+            
+            // Send the updated report over USB
+            send_gamepad_report(hid_dev_gamepad);
+        }
+
+        // Handle other USB HID reports if needed
+        if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
+            if (!send_report(do_send_report)) {
+                k_sem_give(&usb_sem0);
+            }
+        }
+        if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
+            if (!send_monitor_report(do_send_report)) {
+                k_sem_give(&usb_sem1);
+            }
+        }
+
+        // Handle other tasks as needed
+
+        k_sleep(K_MSEC(1));
     }
 
-    if (!CHK(bt_conn_auth_cb_register(&conn_auth_callbacks))) {
-        return;
-    }
-
-    if (!CHK(bt_conn_auth_info_cb_register(&conn_auth_info_callbacks))) {
-        return;
-    }
-
-    CHK(bt_enable(NULL));
+    return 0;
 }
 
+
+static void bt_ready(int err)
+{
+    if (err) {
+        printk("Bluetooth init failed (err %d)\n", err);
+        return;
+    }
+
+    printk("Bluetooth initialized\n");
+
+    const char *device_name = "HID Remapper Bluetooth";
+    bt_set_name(device_name);
+
+    struct bt_le_adv_param adv_param = {
+        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer = NULL,
+    };
+
+    const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, device_name, strlen(device_name)),
+    };
+
+    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        printk("Advertising failed to start (err %d)\n", err);
+        return;
+    }
+
+    printk("Advertising successfully started\n");
+}
+
+static void bt_init()
+{
+    if (!CHK(bt_enable(bt_ready))) {
+        return;
+    }
+}
 static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
     LOG_INF("len=%d", len);
 
@@ -866,6 +724,8 @@ int main() {
     scan_init();
     parse_our_descriptor();
     set_mapping_from_config();
+    
+    uart_init();
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 
