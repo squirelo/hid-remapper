@@ -10,6 +10,14 @@ LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
 #define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
 
+typedef struct {
+    uint16_t buttons;
+    uint8_t hat;
+    int8_t x;
+    int8_t y;
+    int8_t z;
+    int8_t rz;
+} hid_gamepad_report_t;
 // HID report descriptor for gamepad
 static const uint8_t hid_report_desc[] = {
     0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
@@ -49,6 +57,9 @@ static const uint8_t hid_report_desc[] = {
 };
 
 static const struct device* hid_dev;
+/ Add this forward declaration before the attrs array
+static ssize_t write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
+                        const void* buf, uint16_t len, uint16_t offset, uint8_t flags);
 
 static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
     0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
@@ -96,7 +107,13 @@ static ssize_t write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
     // Process the received gamepad data and send it to USB HID
     if (len == sizeof(hid_gamepad_report_t)) {
         const hid_gamepad_report_t* gp = (const hid_gamepad_report_t*)buf;
-        hid_int_ep_write(hid_dev, (const uint8_t*)gp, sizeof(hid_gamepad_report_t), NULL);
+        uint8_t report_with_id[sizeof(hid_gamepad_report_t) + 1];
+        report_with_id[0] = 0; // Assuming report ID 0, adjust if needed
+        memcpy(report_with_id + 1, gp, sizeof(hid_gamepad_report_t));
+        
+        if (hid_dev0) {
+            CHK(hid_int_ep_write(hid_dev0, report_with_id, sizeof(report_with_id), NULL));
+        }
     }
 
     return len;
@@ -140,14 +157,7 @@ static void bt_ready(int err) {
     LOG_INF("Advertising started");
 }
 
-typedef struct {
-    uint16_t buttons;
-    uint8_t hat;
-    int8_t x;
-    int8_t y;
-    int8_t z;
-    int8_t rz;
-} hid_gamepad_report_t;
+
 
 int main(void) {
     int err;
