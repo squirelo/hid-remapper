@@ -107,18 +107,13 @@ static ssize_t write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
     // Process the received gamepad data and send it to USB HID
     if (len == sizeof(hid_gamepad_report_t)) {
         const hid_gamepad_report_t* gp = (const hid_gamepad_report_t*)buf;
-        uint8_t report_with_id[sizeof(hid_gamepad_report_t) + 1];
-        report_with_id[0] = 0; // Assuming report ID 0, adjust if needed
-        memcpy(report_with_id + 1, gp, sizeof(hid_gamepad_report_t));
-        
-        if (hid_dev0) {
-            CHK(hid_int_ep_write(hid_dev0, report_with_id, sizeof(report_with_id), NULL));
+        if (hid_dev) {  // Changed from hid_dev0 to hid_dev
+            CHK(hid_int_ep_write(hid_dev, (const uint8_t*)gp, sizeof(hid_gamepad_report_t), NULL));
         }
     }
 
     return len;
 }
-
 static int set_report_cb(const struct device* dev, struct usb_setup_packet* setup, int32_t* len, uint8_t** data) {
     LOG_INF("Set report callback");
     return 0;
