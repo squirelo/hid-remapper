@@ -65,7 +65,7 @@ static struct bt_uuid_128 uart_tx_uuid = BT_UUID_INIT_128(
 static struct bt_gatt_attr attrs[] = {
     BT_GATT_PRIMARY_SERVICE(&uart_service_uuid),
     BT_GATT_CHARACTERISTIC(&uart_rx_uuid.uuid, BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_WRITE, NULL, NULL, NULL),
+                           BT_GATT_PERM_WRITE, NULL, write_cb, NULL),
     BT_GATT_CHARACTERISTIC(&uart_tx_uuid.uuid, BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_NONE, NULL, NULL, NULL),
 };
@@ -140,7 +140,16 @@ static void bt_ready(int err) {
     LOG_INF("Advertising started");
 }
 
-void main(void) {
+typedef struct {
+    uint16_t buttons;
+    uint8_t hat;
+    int8_t x;
+    int8_t y;
+    int8_t z;
+    int8_t rz;
+} hid_gamepad_report_t;
+
+int main(void) {
     int err;
 
     LOG_INF("Starting HID Remapper Bluetooth");
@@ -148,7 +157,7 @@ void main(void) {
     hid_dev = device_get_binding("HID_0");
     if (hid_dev == NULL) {
         LOG_ERR("Cannot get USB HID Device");
-        return;
+        return -1;
     }
 
     usb_hid_register_device(hid_dev, hid_report_desc, sizeof(hid_report_desc), &ops);
@@ -161,10 +170,12 @@ void main(void) {
     err = bt_enable(bt_ready);
     if (err) {
         LOG_ERR("Bluetooth init failed (err %d)", err);
-        return;
+        return -1;
     }
 
     while (1) {
         k_sleep(K_FOREVER);
     }
+
+    return 0;  // This line will never be reached, but it satisfies the compiler
 }
