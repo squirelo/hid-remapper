@@ -41,6 +41,9 @@ static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HI
 static auto BT_ADDR_LE_ANY_ = BT_ADDR_LE_ANY[0];
 static auto BT_CONN_LE_CREATE_CONN_ = BT_CONN_LE_CREATE_CONN[0];
 
+#define GAMEPAD_SERVICE_UUID        BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef0)
+#define GAMEPAD_CHARACTERISTIC_UUID BT_UUID_128_ENCODE(0x87654321, 0x4321, 0x8765, 0x4321, 0xfedcba987654)
+
 static struct bt_uuid_128 gamepad_service_uuid = BT_UUID_INIT_128(GAMEPAD_SERVICE_UUID);
 static struct bt_uuid_128 gamepad_char_uuid = BT_UUID_INIT_128(GAMEPAD_CHARACTERISTIC_UUID);
 
@@ -149,24 +152,17 @@ static void send_gamepad_report(const struct device *dev) {
 
 static void gamepad_service_init(void)
 {
-    gamepad_chars[0] = (struct bt_gatt_chr_def) {
-        .uuid = &gamepad_char_uuid.uuid,
-        .props = BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-        .write = write_gamepad,
-    };
+    gamepad_chars[0] = BT_GATT_CHARACTERISTIC(&gamepad_char_uuid.uuid,
+                                              BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+                                              BT_GATT_PERM_WRITE,
+                                              NULL, write_gamepad, NULL);
+    gamepad_chars[1] = BT_GATT_CHARACTERISTIC_END;
 
-    gamepad_chars[1] = (struct bt_gatt_chr_def) { 0 };
-
-    gamepad_service = (struct bt_gatt_service_static) {
-        .attrs = (struct bt_gatt_attr[]) {
-            BT_GATT_PRIMARY_SERVICE(&gamepad_service_uuid),
-            BT_GATT_CHARACTERISTIC(gamepad_chars),
-            BT_GATT_DESCRIPTOR(&gamepad_char_uuid, BT_GATT_PERM_WRITE, NULL, write_gamepad, NULL),
-        },
-        .attr_count = 3,
-    };
-
-    bt_gatt_service_register(&gamepad_service);
+    BT_GATT_SERVICE_DEFINE(gamepad_svc,
+        BT_GATT_PRIMARY_SERVICE(&gamepad_service_uuid),
+        gamepad_chars[0],
+        gamepad_chars[1],
+    );
 }
 
 static void activity_led_off_work_fn(struct k_work* work) {
@@ -532,6 +528,12 @@ static void usb_init() {
     CHK(usb_enable(status_cb));
 }
 
+static bool peers_only = false;
+static struct k_work_delayable scan_start_work;
+static struct k_work clear_bonds_work;
+
+void scan_init(void);
+
 int main(void)
 {
     LOG_INF("Starting Bluetooth Gamepad Peripheral");
@@ -578,84 +580,25 @@ int main(void)
     return 0;
 }
 
-
-static void bt_ready(int err)
-{
-    if (err) {
-        printk("Bluetooth init failed (err %d)\n", err);
-        return;
-    }
-
-    printk("Bluetooth initialized\n");
-
-    const char *device_name = "HID Remapper Bluetooth";
-    bt_set_name(device_name);
-
-    struct bt_le_adv_param adv_param = {
-        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
-        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
-        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
-        .peer = NULL,
-    };
-
-    const struct bt_data ad[] = {
-        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-        BT_DATA(BT_DATA_NAME_COMPLETE, device_name, strlen(device_name)),
-    };
-
-    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
-    if (err) {
-        printk("Advertising failed to start (err %d)\n", err);
-        return;
-    }
-
-    printk("Advertising successfully started\n");
-}
-
-static void bt_init()
-{
-    if (!CHK(bt_enable(bt_ready))) {
-        return;
-    }
-}
-static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
-    LOG_INF("len=%d", len);
-
-    static uint8_t buffer[PERSISTED_CONFIG_SIZE];
-
-    if (len != PERSISTED_CONFIG_SIZE) {
-        return -EINVAL;
-    }
-
-    int bytes_read = read_cb(cb_arg, buffer, len);
-
-    if (bytes_read < 0) {
-        return bytes_read;
-    }
-
-    if (bytes_read != PERSISTED_CONFIG_SIZE) {
-        return -EINVAL;
-    }
-
-    //    LOG_HEXDUMP_DBG(buffer, len, "");
-
-    load_config(buffer);
-
-    return 0;
-}
-
 static struct settings_handler our_settings_handlers = {
     .name = "remapper",
     .h_set = remapper_settings_set,
 };
 
-void do_persist_config(uint8_t* buffer) {
-    LOG_INF("");
-    CHK(settings_save_one("remapper/config", buffer, PERSISTED_CONFIG_SIZE));
-}
+static const uint8_t hid_gamepad_report_desc[] = {
+    // Add your gamepad HID report descriptor here
+};
 
-// https://github.com/adafruit/Adafruit_nRF52_Bootloader/blob/master/src/main.c#L116
-const int DFU_MAGIC_UF2_RESET = 0x57;
+static const struct hid_ops ops_gamepad = {
+    .get_report = get_report_cb,
+    .set_report = set_report_cb,
+    .int_in_ready = int_in_ready_cb_gamepad,
+};
+
+static void int_in_ready_cb_gamepad(const struct device *dev)
+{
+    k_sem_give(&usb_sem_gamepad);
+}
 
 void reset_to_bootloader() {
     sys_reboot(DFU_MAGIC_UF2_RESET);
@@ -707,78 +650,4 @@ void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len
 }
 
 void set_gpio_inout_masks(uint32_t in_mask, uint32_t out_mask) {
-}
-
-int main() {
-    LOG_INF("HID Remapper Bluetooth");
-
-    my_mutexes_init();
-    button_init();
-    leds_init();
-    bt_init();
-    CHK(settings_subsys_init());
-    CHK(settings_register(&our_settings_handlers));
-    settings_load();
-    descriptor_init();
-    usb_init();
-    scan_init();
-    parse_our_descriptor();
-    set_mapping_from_config();
-    
-    uart_init();
-
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-
-    struct report_type incoming_report;
-    struct descriptor_type incoming_descriptor;
-    struct disconnected_type disconnected_item;
-
-    while (true) {
-        while (!k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
-            handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.conn_idx << 8);
-        }
-        if (atomic_test_and_clear_bit(tick_pending, 0)) {
-            process_mapping(true);
-        }
-        if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
-            if (!send_report(do_send_report)) {
-                k_sem_give(&usb_sem0);
-            }
-        }
-        if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
-            if (!send_monitor_report(do_send_report)) {
-                k_sem_give(&usb_sem1);
-            }
-        }
-
-        while (!k_msgq_get(&disconnected_q, &disconnected_item, K_NO_WAIT)) {
-            LOG_INF("device_disconnected_callback conn_idx=%d", disconnected_item.conn_idx);
-            device_disconnected_callback(disconnected_item.conn_idx);
-        }
-
-        while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
-            LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
-            parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
-        }
-
-        if (config_updated) {
-            set_mapping_from_config();
-            config_updated = false;
-        }
-
-        if (their_descriptor_updated) {
-            update_their_descriptor_derivates();
-            their_descriptor_updated = false;
-        }
-
-        if (need_to_persist_config) {
-            persist_config();
-            need_to_persist_config = false;
-        }
-
-        // without this sleep, some devices won't pair; some thread priority issue?
-        k_sleep(K_USEC(1));  // XXX
-    }
-
-    return 0;
 }
