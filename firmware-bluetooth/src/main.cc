@@ -57,7 +57,7 @@ static const uint8_t hid_report_desc[] = {
 };
 
 static const struct device* hid_dev;
-/ Add this forward declaration before the attrs array
+
 static ssize_t write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
                         const void* buf, uint16_t len, uint16_t offset, uint8_t flags);
 
