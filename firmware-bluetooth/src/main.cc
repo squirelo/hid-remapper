@@ -791,6 +791,13 @@ static void usb_init() {
     CHK(usb_enable(status_cb));
 }
 
+// Move the ad array definition before bt_init()
+static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+    BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL))
+};
+
 static void bt_init() {
     for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
         bt_hogp_init(&hogps[i], &hogp_init_params);
@@ -805,6 +812,20 @@ static void bt_init() {
     }
 
     CHK(bt_enable(NULL));
+    
+    // Start advertising after Bluetooth is enabled
+    struct bt_le_adv_param adv_param = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY,
+        BT_GAP_ADV_FAST_INT_MIN_2,
+        BT_GAP_ADV_FAST_INT_MAX_2,
+        NULL);
+
+    int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+    } else {
+        LOG_INF("Advertising successfully started");
+    }
 }
 
 static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
@@ -910,6 +931,8 @@ static void ble_peripheral_init(void) {
     const struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
         BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+        // Add HID Service UUID to advertisement data
+        BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL))
     };
 
     /* If you wish, define scan response data here.
