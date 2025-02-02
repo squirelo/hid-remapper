@@ -899,6 +899,68 @@ void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len
 void set_gpio_inout_masks(uint32_t in_mask, uint32_t out_mask) {
 }
 
+// New function: ble_peripheral_init()
+// This function sets up advertisement parameters and starts advertising.
+// It can also be expanded to register a GATT service if needed.
+static void ble_peripheral_init(void) {
+    /* Define advertisement data.
+     * In this example we advertise the general discoverable flag and the device name.
+     * Ensure that CONFIG_BT_DEVICE_NAME is defined (typically in prj.conf).
+     */
+    const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+    };
+
+    /* If you wish, define scan response data here.
+     * For now, we leave it empty.
+     */
+    const struct bt_data sd[] = {};
+
+    /* Advertisement parameters:
+     *  - BT_LE_ADV_OPT_CONNECTABLE allows other devices to connect,
+     *  - BT_LE_ADV_OPT_USE_IDENTITY makes sure the identity address is used.
+     */
+    struct bt_le_adv_param adv_param = {
+        .options     = (BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_IDENTITY),
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer         = NULL,
+    };
+
+    int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+    } else {
+        LOG_INF("Advertising successfully started");
+    }
+}
+
+/* Optional: Minimal GATT service definition.
+ * This example creates a custom service (using the Device Information Service UUID 0x180A)
+ * with one read-only characteristic (Manufacturer Name string, UUID 0x2A29).
+ */
+static const char manufacturer_name[] = "MyCompany";
+
+static ssize_t read_manufacturer(struct bt_conn *conn,
+                                 const struct bt_gatt_attr *attr,
+                                 void *buf, uint16_t len,
+                                 uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, manufacturer_name, sizeof(manufacturer_name) - 1);
+}
+
+/* Register the service using the macro.
+ * If you would rather add your own, you can also use bt_gatt_service_register() during initialization.
+ */
+BT_GATT_SERVICE_DEFINE(custom_service,
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_16(0x180A)),
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_16(0x2A29),
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           read_manufacturer, NULL, NULL),
+);
+
 int main() {
     LOG_INF("HID Remapper Bluetooth");
 
@@ -906,12 +968,17 @@ int main() {
     button_init();
     leds_init();
     bt_init();
+
     CHK(settings_subsys_init());
     CHK(settings_register(&our_settings_handlers));
     settings_load();
     descriptor_init();
     usb_init();
-    scan_init();
+    // scan_init();
+
+    // Initialize BLE peripheral role (advertising and, optionally, GATT service)
+    ble_peripheral_init();
+
     parse_our_descriptor();
     set_mapping_from_config();
 
