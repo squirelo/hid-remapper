@@ -276,12 +276,12 @@ const uint8_t our_report_descriptor_horipad[] = {
     0x35, 0x00,        //   Physical Minimum (0)
     0x45, 0x01,        //   Physical Maximum (1)
     0x75, 0x01,        //   Report Size (1)
-    0x95, 0x0E,        //   Report Count (14)
+    0x95, 0x14,        //   Report Count (20)
     0x05, 0x09,        //   Usage Page (Button)
     0x19, 0x01,        //   Usage Minimum (0x01)
-    0x29, 0x0E,        //   Usage Maximum (0x0E)
+    0x29, 0x14,        //   Usage Maximum (0x14)
     0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-    0x95, 0x02,        //   Report Count (2)
+    0x95, 0x04,        //   Report Count (4)
     0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
     0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
     0x25, 0x07,        //   Logical Maximum (7)
@@ -541,7 +541,7 @@ uint16_t kb_mouse_handle_get_report(uint8_t report_id, uint8_t* buffer, uint16_t
     return 0;
 }
 
-static const uint8_t horipad_neutral[] = { 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
+static const uint8_t horipad_neutral[] = { 0x00, 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
 
 void horipad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
     memcpy(report, horipad_neutral, sizeof(horipad_neutral));
