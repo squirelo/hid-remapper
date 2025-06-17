@@ -541,7 +541,7 @@ uint16_t kb_mouse_handle_get_report(uint8_t report_id, uint8_t* buffer, uint16_t
     return 0;
 }
 
-static const uint8_t horipad_neutral[] = { 0x00, 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
+static const uint8_t horipad_neutral[] = { 0x00, 0x00, 0x00, 0x08, 0x80, 0x80, 0x80, 0x80, 0x00 };
 
 void horipad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
     memcpy(report, horipad_neutral, sizeof(horipad_neutral));
@@ -569,7 +569,7 @@ void xac_compat_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
 int32_t horipad_default_value(uint32_t usage) {
     switch (usage) {
         case 0x00010039:
-            return 15;
+            return 8;
         case 0x00010030:
         case 0x00010031:
         case 0x00010032:
