@@ -26,6 +26,7 @@
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
+#include "crc.h"  // If you have this from your receiver project
 
 LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
@@ -51,6 +52,28 @@ static struct bt_uuid_128 uart_rx_uuid = BT_UUID_INIT_128(
 static struct bt_uuid_128 uart_tx_uuid = BT_UUID_INIT_128(
     0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
     0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E);
+
+// Add packet structure definitions similar to the receiver
+#define PROTOCOL_VERSION 1
+#define SERIAL_MAX_PACKET_SIZE 512
+
+#define END 0300     /* indicates end of packet */
+#define ESC 0333     /* indicates byte stuffing */
+#define ESC_END 0334 /* ESC ESC_END means END data byte */
+#define ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
+
+typedef struct __attribute__((packed)) {
+    uint8_t protocol_version;
+    uint8_t our_descriptor_number;
+    uint8_t len;
+    uint8_t report_id;
+    uint8_t data[0];
+} packet_t;
+
+// Packet buffer and state for SLIP-like framing
+static uint8_t packet_buffer[SERIAL_MAX_PACKET_SIZE];
+static uint16_t bytes_read = 0;
+static bool escaped = false;
 
 static void peripheral_mode_init(void);
 static void process_peripheral_command(uint8_t* buf, int count);
@@ -507,55 +530,22 @@ static void peripheral_mode_init(void) {
     // Disconnect any existing host connections
     bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     
-    // Simulate connecting a virtual gamepad so the HID remapper system has something to work with
-    // This creates a virtual "peripheral gamepad" interface that the system can map from
-    uint16_t virtual_interface = 0xFF00; // Use a special interface ID for peripheral
+    // Initialize packet reception state
+    bytes_read = 0;
+    escaped = false;
     
-    // Simple gamepad descriptor exactly matching app byte layout
-    static const uint8_t virtual_gamepad_descriptor[] = {
-        0x05, 0x01,        // Usage Page (Generic Desktop)
-        0x09, 0x05,        // Usage (Game Pad)
-        0xA1, 0x01,        // Collection (Application)
-        0x85, 0x01,        //   Report ID (1)
-        
-        // All buttons as one block (20 buttons total)
-        0x05, 0x09,        //   Usage Page (Button)
-        0x19, 0x01,        //   Usage Minimum (Button 1)
-        0x29, 0x14,        //   Usage Maximum (Button 20)
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x01,        //   Logical Maximum (1)
-        0x75, 0x01,        //   Report Size (1)
-        0x95, 0x14,        //   Report Count (20)
-        0x81, 0x02,        //   Input (Data,Var,Abs)
-        
-        // 4 bits padding to complete 3 bytes (24 bits total)
-        0x75, 0x04,        //   Report Size (4)
-        0x95, 0x01,        //   Report Count (1)
-        0x81, 0x03,        //   Input (Const,Var,Abs) - padding
-        
-        // 4 analog stick axes
-        0x05, 0x01,        //   Usage Page (Generic Desktop)
-        0x09, 0x30,        //   Usage (X) - Left stick X
-        0x09, 0x31,        //   Usage (Y) - Left stick Y
-        0x09, 0x32,        //   Usage (Z) - Right stick X
-        0x09, 0x35,        //   Usage (Rz) - Right stick Y
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-        0x75, 0x08,        //   Report Size (8)
-        0x95, 0x04,        //   Report Count (4)
-        0x81, 0x02,        //   Input (Data,Var,Abs)
-        
-        // 1 unused byte
-        0x75, 0x08,        //   Report Size (8)
-        0x95, 0x01,        //   Report Count (1)
-        0x81, 0x03,        //   Input (Const,Var,Abs) - padding
-        
-        0xC0               // End Collection
-    };
+    // Create a virtual device that can handle the packet protocol
+    // Use the current our_descriptor_number configuration
+    uint16_t virtual_interface = 0xFF00;
     
-    // Parse the virtual descriptor
-    parse_descriptor(0xCAFE, 0xBABE, virtual_gamepad_descriptor, sizeof(virtual_gamepad_descriptor), virtual_interface, 0);
-    device_connected_callback(virtual_interface, 0xCAFE, 0xBABE, 0);
+    // Parse the appropriate descriptor based on our_descriptor_number
+    if (our_descriptor_number < NOUR_DESCRIPTORS) {
+        parse_descriptor(0xCAFE, 0xBABE, 
+                        our_descriptors[our_descriptor_number].descriptor, 
+                        our_descriptors[our_descriptor_number].descriptor_length, 
+                        virtual_interface, 0);
+        device_connected_callback(virtual_interface, 0xCAFE, 0xBABE, 0);
+    }
     
     // Set LED to indicate peripheral mode (blinking = advertising/waiting for connection)
     set_led_mode(LedMode::BLINK);
@@ -563,8 +553,7 @@ static void peripheral_mode_init(void) {
     // Start advertising
     start_peripheral_advertising();
     
-    LOG_INF("Peripheral mode initialized with virtual gamepad");
-
+    LOG_INF("Peripheral mode initialized with packet protocol (descriptor %d)", our_descriptor_number);
 }
 
 static void start_peripheral_advertising(void) {
@@ -580,30 +569,101 @@ static void start_peripheral_advertising(void) {
 
     static const struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-        BT_DATA(BT_DATA_NAME_COMPLETE, "playAbility", 11),
+        BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
     };
 
     CHK(bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0));
-    LOG_INF("Peripheral advertising started as 'playAbility'");
+    LOG_INF("Peripheral advertising started as '%s'", CONFIG_BT_DEVICE_NAME);
 }
 
-static void process_peripheral_command(uint8_t* buf, int count) {
-    // Handle raw gamepad data (8 bytes matching app format)
-    if (count >= 8) {
-        uint8_t report[9];
-        report[0] = 1; // Report ID
-        memcpy(report + 1, buf, 8); // Copy 8 bytes of gamepad data directly
-        
-        // Inject into HID remapper system
-        handle_received_report(report, sizeof(report), 0xFF00, 1);
-        LOG_INF("Received 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
-        LOG_INF("Report sent: %02X %02X %02X %02X %02X %02X %02X %02X %02X", 
-                report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7], report[8]);
+static void handle_received_packet(const uint8_t* data, uint16_t len) {
+    if (len < sizeof(packet_t)) {
+        LOG_WRN("Packet too small: %d", len);
+        return;
+    }
+    
+    packet_t* msg = (packet_t*) data;
+    len = len - sizeof(packet_t);
+    
+    if ((msg->protocol_version != PROTOCOL_VERSION) ||
+        (msg->len != len) ||
+        (len > 64) ||
+        (msg->our_descriptor_number >= NOUR_DESCRIPTORS) ||
+        ((msg->report_id == 0) && (len >= 64))) {
+        LOG_WRN("Invalid packet: proto=%d, len=%d, desc=%d, report_id=%d", 
+                msg->protocol_version, msg->len, msg->our_descriptor_number, msg->report_id);
+        return;
+    }
+    
+    // Handle descriptor change
+    if (msg->our_descriptor_number != our_descriptor_number) {
+        our_descriptor_number = msg->our_descriptor_number;
+        // Persist config if needed
+        LOG_INF("Descriptor number changed to %d", our_descriptor_number);
+    }
+    
+    // Create HID report with report ID
+    uint8_t report[65];
+    report[0] = msg->report_id;
+    memcpy(report + 1, msg->data, len);
+    
+    // Inject into HID remapper system
+    handle_received_report(report, len + 1, 0xFF00, msg->report_id);
+    
+    LOG_INF("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
+            msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
+}
+
+static void process_byte_with_framing(uint8_t c) {
+    bytes_read %= sizeof(packet_buffer);
+
+    if (escaped) {
+        switch (c) {
+            case ESC_END:
+                packet_buffer[bytes_read++] = END;
+                break;
+            case ESC_ESC:
+                packet_buffer[bytes_read++] = ESC;
+                break;
+            default:
+                // this shouldn't happen
+                packet_buffer[bytes_read++] = c;
+                break;
+        }
+        escaped = false;
+    } else {
+        switch (c) {
+            case END:
+                if (bytes_read > 4) {
+                    uint32_t crc = crc32(packet_buffer, bytes_read - 4);
+                    uint32_t received_crc = 0;
+                    for (int i = 0; i < 4; i++) {
+                        received_crc = (received_crc << 8) | packet_buffer[bytes_read - 1 - i];
+                    }
+                    if (crc == received_crc) {
+                        handle_received_packet(packet_buffer, bytes_read - 4);
+                    } else {
+                        LOG_WRN("CRC error: expected 0x%08X, got 0x%08X", crc, received_crc);
+                    }
+                }
+                bytes_read = 0;
+                break;
+            case ESC:
+                escaped = true;
+                break;
+            default:
+                packet_buffer[bytes_read++] = c;
+                break;
+        }
     }
 }
 
-
+static void process_peripheral_command(uint8_t* buf, int count) {
+    // Process each byte with SLIP-like framing
+    for (int i = 0; i < count; i++) {
+        process_byte_with_framing(buf[i]);
+    }
+}
 
 static void connected(struct bt_conn* conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -932,6 +992,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;  // Default case - interface not supported
 }
 
 static void button_init() {
