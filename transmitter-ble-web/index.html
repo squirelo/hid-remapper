@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+
+<head>
+    <script src="code.js" type="module"></script>
+    <style>
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            max-width: 600px;
+            margin: 20px 0;
+        }
+        
+        .button-group {
+            border: 1px solid #ccc;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        
+        .button-group h4 {
+            margin: 0 0 10px 0;
+            text-align: center;
+        }
+        
+        .gamepad-button {
+            margin: 2px;
+            padding: 8px 12px;
+            background: #f0f0f0;
+            border: 2px solid #ccc;
+            border-radius: 4px;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        .gamepad-button.pressed {
+            background: #4CAF50;
+            color: white;
+            border-color: #45a049;
+        }
+        
+        .dpad {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            grid-template-rows: 1fr 1fr 1fr;
+            gap: 2px;
+            width: 120px;
+            height: 120px;
+            margin: 0 auto;
+        }
+        
+        .dpad-btn {
+            background: #f0f0f0;
+            border: 2px solid #ccc;
+            border-radius: 4px;
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+        
+        .dpad-btn.pressed {
+            background: #4CAF50;
+            color: white;
+            border-color: #45a049;
+        }
+        
+        .stick-controls {
+            text-align: center;
+        }
+        
+        .stick-input {
+            width: 60px;
+            margin: 2px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>HID Transmitter (BLE) - Switch Gamepad</h1>
+    <p>
+        <button id="connect_ble">Connect to BLE Device</button>
+        <button id="disconnect_ble" style="display: none;">Disconnect</button>
+    </p>
+    
+    <div class="controls">
+        <div class="button-group">
+            <h4>Face Buttons</h4>
+            <button id="button_a" class="gamepad-button">A</button>
+            <button id="button_b" class="gamepad-button">B</button>
+            <button id="button_x" class="gamepad-button">X</button>
+            <button id="button_y" class="gamepad-button">Y</button>
+        </div>
+        
+        <div class="button-group">
+            <h4>D-Pad</h4>
+            <div class="dpad">
+                <div></div>
+                <button id="dpad_up" class="dpad-btn">↑</button>
+                <div></div>
+                <button id="dpad_left" class="dpad-btn">←</button>
+                <div></div>
+                <button id="dpad_right" class="dpad-btn">→</button>
+                <div></div>
+                <button id="dpad_down" class="dpad-btn">↓</button>
+                <div></div>
+            </div>
+        </div>
+        
+        <div class="button-group">
+            <h4>Shoulder/System</h4>
+            <button id="button_l" class="gamepad-button">L</button>
+            <button id="button_r" class="gamepad-button">R</button>
+            <button id="button_zl" class="gamepad-button">ZL</button>
+            <button id="button_zr" class="gamepad-button">ZR</button>
+            <br>
+            <button id="button_minus" class="gamepad-button">-</button>
+            <button id="button_plus" class="gamepad-button">+</button>
+            <button id="button_home" class="gamepad-button">HOME</button>
+        </div>
+    </div>
+    
+    <p>Keep this window visible. Virtual buttons work in toggle mode - click to turn on/off.</p>
+    <p><small>Note: Web Bluetooth requires HTTPS in Chrome. Use chrome://flags/#enable-experimental-web-platform-features for testing.</small></p>
+    <pre id="output">
+    </pre>
+</body>
+
+</html>
