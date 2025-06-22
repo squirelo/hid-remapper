@@ -184,7 +184,7 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static bool scanning = false;
 static bool peers_only = true;
 
-static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
+static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(12, 24, 0, 3000);
 
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
@@ -271,6 +271,21 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
         peripheral_conn = bt_conn_ref(conn);
         LOG_INF("Peripheral connected");
         set_led_mode(LedMode::ON);
+        
+        // Request stable connection parameters for peripheral mode
+        struct bt_le_conn_param param = {
+            .interval_min = 12,  // 15ms minimum
+            .interval_max = 24,  // 30ms maximum  
+            .latency = 0,        // No latency for real-time data
+            .timeout = 3000      // 30 second timeout
+        };
+        
+        int ret = bt_conn_le_param_update(conn, &param);
+        if (ret) {
+            LOG_WRN("Failed to update connection parameters: %d", ret);
+        } else {
+            LOG_INF("Requested stable connection parameters");
+        }
     }
 }
 
@@ -360,6 +375,12 @@ static bool scan_setup_filters() {
 }
 
 static void scan_start_work_fn(struct k_work* work) {
+    // Don't scan aggressively when in peripheral mode to avoid interference
+    if (current_mode == MODE_PERIPHERAL && peripheral_conn) {
+        LOG_DBG("Skipping scan - peripheral mode with active connection");
+        return;
+    }
+    
     if (scanning) {
         scan_stop();
     }
@@ -679,8 +700,10 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-
+        // Only restart scanning if we're in host mode
+        if (current_mode == MODE_HOST) {
+            k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+        }
         return;
     }
 
@@ -707,7 +730,10 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     count_connections();
 
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    // Only restart scanning if we're in host mode
+    if (current_mode == MODE_HOST) {
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
 }
 
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
@@ -718,7 +744,10 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
         peers_only = true;
-        gatt_discover(conn);
+        // Only start discovery if we're in host mode
+        if (current_mode == MODE_HOST) {
+            gatt_discover(conn);
+        }
     } else {
         LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
     }
@@ -729,8 +758,15 @@ static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t l
 }
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
-    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", param->interval_min, param->interval_max, param->latency, param->timeout);
-    param->interval_max = param->interval_min;
+    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", 
+            param->interval_min, param->interval_max, param->latency, param->timeout);
+    
+    // Accept wider range of parameters for better compatibility
+    if (param->interval_min < 6) param->interval_min = 6;     // Minimum 7.5ms
+    if (param->interval_max > 800) param->interval_max = 800; // Maximum 1000ms
+    if (param->timeout < 100) param->timeout = 100;          // Minimum 1s timeout
+    if (param->timeout > 3200) param->timeout = 3200;        // Maximum 32s timeout
+    
     return true;
 }
 
@@ -772,10 +808,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         return BT_GATT_ITER_STOP;
     }
 
-    if (scanning) {
+    // Don't aggressively restart scanning if we're in peripheral mode
+    if (scanning && current_mode != MODE_PERIPHERAL) {
         scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
         k_work_submit(&scan_stop_work);
-    } else {
+    } else if (current_mode != MODE_PERIPHERAL) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 
