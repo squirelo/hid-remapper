@@ -1259,8 +1259,6 @@ static int remapper_settings_set(const char* name, size_t len, settings_read_cb 
         return -EINVAL;
     }
 
-    //    LOG_HEXDUMP_DBG(buffer, len, "");
-
     load_config(buffer);
 
     return 0;
@@ -1310,7 +1308,6 @@ void disable_host_mode() {
         if (scanning) {
             scan_stop();
         }
-        // Disconnect host connections
         bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     }
 }
@@ -1327,9 +1324,7 @@ void disable_peripheral_mode() {
     if (peripheral_mode_enabled) {
         peripheral_mode_enabled = false;
         LOG_INF("Peripheral mode disabled");
-        // Stop advertising
         CHK(bt_le_adv_stop());
-        // Disconnect peripheral connection
         if (peripheral_conn) {
             CHK(bt_conn_disconnect(peripheral_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
         }
@@ -1337,7 +1332,6 @@ void disable_peripheral_mode() {
 }
 
 void enable_dual_mode() {
-    // Enable both modes for full functionality
     if (!peripheral_mode_enabled) {
         enable_peripheral_mode();
     }
@@ -1400,12 +1394,10 @@ int main() {
     parse_our_descriptor();
     set_mapping_from_config();
 
-    // Initialize peripheral mode first (like original)
     if (peripheral_mode_enabled) {
         peripheral_mode_init();
     }
     
-    // Start host mode (always enabled)
     if (host_mode_enabled) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
@@ -1422,7 +1414,6 @@ int main() {
     int64_t last_led_update = 0;
 
     while (true) {
-        // Host mode functionality - always process if enabled
         if (host_mode_enabled) {
             if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
                 handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
@@ -1445,36 +1436,30 @@ int main() {
             }
         }
         
-        // Process periodic ticks for remapping (needed for both modes)
         if (atomic_test_and_clear_bit(tick_pending, 0)) {
             process_mapping(true);
             process_pending = false;
         }
         
-        // Update LED status periodically (every 5 seconds)
         int64_t current_time = k_uptime_get();
         if (current_time - last_led_update > 5000) {
             update_led_status();
             last_led_update = current_time;
         }
-        // OPTIMIZATION 9: Non-blocking USB HID report transmission using work queue
         send_report(do_send_report);
         send_monitor_report(do_send_report);
         
-        // Process queued outgoing reports (legacy support)
         if (or_items > 0) {
             uint8_t report_with_id[65];
             report_with_id[0] = outgoing_reports[or_head].report_id;
             memcpy(report_with_id + 1, outgoing_reports[or_head].data, outgoing_reports[or_head].len);
             
             if (do_send_report(0, report_with_id, outgoing_reports[or_head].len + 1)) {
-                // Successfully queued, remove from legacy queue
                 or_head = (or_head + 1) % OR_BUFSIZE;
                 or_items--;
             }
         }
         
-        // Trigger USB HID work processing
         k_work_submit(&usb_hid_tx_work);
 
         if (!k_msgq_get(&set_report_q, &set_report_item, K_NO_WAIT)) {
