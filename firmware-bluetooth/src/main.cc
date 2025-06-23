@@ -209,10 +209,6 @@ static bool peers_only = true;
 
 static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(12, 24, 0, 3000);
 
-// Coordination flags for peripheral-host mode interaction
-static volatile bool request_scan_stop = false;
-static volatile bool request_scan_resume = false;
-
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
 }
@@ -301,12 +297,6 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
         LOG_INF("Peripheral connected");
         update_led_status();
         
-        // CRITICAL FIX: Stop host scanning when peripheral connects to prevent interference
-        if (host_mode_enabled && scanning) {
-            LOG_INF("Stopping host scanning to avoid peripheral interference");
-            request_scan_stop = true;
-        }
-        
         // Don't aggressively update connection parameters - let them stabilize
         // The original working version didn't force parameter updates
         LOG_INF("Peripheral connection established successfully");
@@ -323,12 +313,6 @@ static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
         
         // Restart advertising
         start_peripheral_advertising();
-        
-        // CRITICAL FIX: Resume host scanning when peripheral disconnects
-        if (host_mode_enabled && !scanning) {
-            LOG_INF("Resuming host scanning after peripheral disconnect");
-            request_scan_resume = true;
-        }
     }
 }
 
@@ -640,7 +624,7 @@ static void peripheral_mode_init(void) {
     escaped = false;
     
     // Create a virtual transmitter device that represents the input source
-    uint16_t virtual_interface = 0xFF00;  // Use proper interface 0x0000
+    uint16_t virtual_interface = 0x0000;  // Use proper interface 0x0000
     
     // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
     // This prevents button offset issues where virtual device gets assigned index 8 
@@ -1474,18 +1458,6 @@ int main() {
                 update_their_descriptor_derivates();
                 their_descriptor_updated = false;
             }
-        }
-        
-        // CRITICAL: Process peripheral-host coordination flags
-        if (request_scan_stop && scanning) {
-            LOG_INF("Processing scan stop request from peripheral connection");
-            scan_stop();
-            request_scan_stop = false;
-        }
-        if (request_scan_resume && !scanning && host_mode_enabled) {
-            LOG_INF("Processing scan resume request from peripheral disconnection");
-            k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-            request_scan_resume = false;
         }
         
         // Process periodic ticks for remapping (needed for both modes)
