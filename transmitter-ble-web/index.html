@@ -88,10 +88,14 @@
     <div class="controls">
         <div class="button-group">
             <h4>Face Buttons</h4>
-            <button id="button_a" class="gamepad-button">A</button>
-            <button id="button_b" class="gamepad-button">B</button>
-            <button id="button_x" class="gamepad-button">X</button>
-            <button id="button_y" class="gamepad-button">Y</button>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; max-width: 120px; margin: 0 auto;">
+                <div></div>
+                <button id="button_x" class="gamepad-button">X</button>
+                <button id="button_y" class="gamepad-button">Y</button>
+                <button id="button_a" class="gamepad-button">A</button>
+                <div></div>
+                <button id="button_b" class="gamepad-button">B</button>
+            </div>
         </div>
         
         <div class="button-group">
@@ -111,19 +115,50 @@
         
         <div class="button-group">
             <h4>Shoulder/System</h4>
-            <button id="button_l" class="gamepad-button">L</button>
-            <button id="button_r" class="gamepad-button">R</button>
-            <button id="button_zl" class="gamepad-button">ZL</button>
-            <button id="button_zr" class="gamepad-button">ZR</button>
-            <br>
-            <button id="button_minus" class="gamepad-button">-</button>
-            <button id="button_plus" class="gamepad-button">+</button>
-            <button id="button_home" class="gamepad-button">HOME</button>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 10px;">
+                <button id="button_l" class="gamepad-button">L</button>
+                <button id="button_r" class="gamepad-button">R</button>
+                <button id="button_zl" class="gamepad-button">ZL</button>
+                <button id="button_zr" class="gamepad-button">ZR</button>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px;">
+                <button id="button_minus" class="gamepad-button">-</button>
+                <button id="button_home" class="gamepad-button">HOME</button>
+                <button id="button_plus" class="gamepad-button">+</button>
+            </div>
         </div>
     </div>
     
-    <p>Keep this window visible. Virtual buttons work in toggle mode - click to turn on/off.</p>
-    <p><small>Note: Web Bluetooth requires HTTPS in Chrome. Use chrome://flags/#enable-experimental-web-platform-features for testing.</small></p>
+    <div class="controls">
+        <div class="button-group">
+            <h4>Analog Sticks</h4>
+            <div class="stick-controls">
+                <div>Left Stick</div>
+                <input type="range" min="0" max="255" value="128" id="left_stick_x" class="stick-input">
+                <input type="range" min="0" max="255" value="128" id="left_stick_y" class="stick-input">
+                <br>
+                <button id="button_ls" class="gamepad-button">LS</button>
+            </div>
+        </div>
+        
+        <div class="button-group">
+            <h4>Right Stick</h4>
+            <div class="stick-controls">
+                <div>Right Stick</div>
+                <input type="range" min="0" max="255" value="128" id="right_stick_x" class="stick-input">
+                <input type="range" min="0" max="255" value="128" id="right_stick_y" class="stick-input">
+                <br>
+                <button id="button_rs" class="gamepad-button">RS</button>
+            </div>
+        </div>
+        
+        <div class="button-group">
+            <h4>Instructions</h4>
+            <p style="font-size: 12px; margin: 5px 0;">Virtual buttons work in toggle mode - click to turn on/off.</p>
+            <p style="font-size: 12px; margin: 5px 0;">Physical gamepads are also supported.</p>
+            <p style="font-size: 10px; margin: 5px 0;">Note: Web Bluetooth requires HTTPS in Chrome.</p>
+        </div>
+    </div>
     <pre id="output">
     </pre>
 </body>

@@ -26,52 +26,84 @@ let virtualButtons = {
     minus: false,
     plus: false,
     home: false,
+    ls: false,
+    rs: false,
     dpad_up: false,
     dpad_down: false,
     dpad_left: false,
     dpad_right: false
 };
 
+// Virtual analog stick states
+let virtualSticks = {
+    lx: 128,
+    ly: 128,
+    rx: 128,
+    ry: 128
+};
+
 document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("connect_ble").addEventListener("click", connect_ble);
     document.getElementById("disconnect_ble").addEventListener("click", disconnect_ble);
     
-    // Setup virtual button event handlers
-    setupVirtualButton("button_a", "a");
-    setupVirtualButton("button_b", "b");
-    setupVirtualButton("button_x", "x");
-    setupVirtualButton("button_y", "y");
-    setupVirtualButton("button_l", "l");
-    setupVirtualButton("button_r", "r");
-    setupVirtualButton("button_zl", "zl");
-    setupVirtualButton("button_zr", "zr");
-    setupVirtualButton("button_minus", "minus");
-    setupVirtualButton("button_plus", "plus");
-    setupVirtualButton("button_home", "home");
-    setupVirtualButton("dpad_up", "dpad_up");
-    setupVirtualButton("dpad_down", "dpad_down");
-    setupVirtualButton("dpad_left", "dpad_left");
-    setupVirtualButton("dpad_right", "dpad_right");
+    // Add event handlers for all virtual buttons
+    const buttonMappings = {
+        'button_a': 'a',
+        'button_b': 'b', 
+        'button_x': 'x',
+        'button_y': 'y',
+        'button_l': 'l',
+        'button_r': 'r',
+        'button_zl': 'zl',
+        'button_zr': 'zr',
+        'button_minus': 'minus',
+        'button_plus': 'plus',
+        'button_home': 'home',
+        'button_ls': 'ls',
+        'button_rs': 'rs',
+        'dpad_up': 'dpad_up',
+        'dpad_down': 'dpad_down',
+        'dpad_left': 'dpad_left',
+        'dpad_right': 'dpad_right'
+    };
+    
+    // Set up event handlers for each button
+    for (const [elementId, buttonKey] of Object.entries(buttonMappings)) {
+        const button = document.getElementById(elementId);
+        if (button) {
+            button.addEventListener("click", function(e) {
+                e.preventDefault();
+                virtualButtons[buttonKey] = !virtualButtons[buttonKey]; // Toggle the state
+                
+                if (virtualButtons[buttonKey]) {
+                    button.classList.add("pressed");
+                } else {
+                    button.classList.remove("pressed");
+                }
+            });
+        }
+    }
+    
+    // Add event handlers for analog stick sliders
+    const stickMappings = {
+        'left_stick_x': 'lx',
+        'left_stick_y': 'ly',
+        'right_stick_x': 'rx',
+        'right_stick_y': 'ry'
+    };
+    
+    for (const [elementId, stickKey] of Object.entries(stickMappings)) {
+        const slider = document.getElementById(elementId);
+        if (slider) {
+            slider.addEventListener("input", function(e) {
+                virtualSticks[stickKey] = parseInt(e.target.value);
+            });
+        }
+    }
     
     output = document.getElementById("output");
     setInterval(loop, 8);
 });
-
-function setupVirtualButton(elementId, buttonKey) {
-    const button = document.getElementById(elementId);
-    if (button) {
-        button.addEventListener("click", function(e) {
-            e.preventDefault();
-            virtualButtons[buttonKey] = !virtualButtons[buttonKey];
-            
-            if (virtualButtons[buttonKey]) {
-                button.classList.add("pressed");
-            } else {
-                button.classList.remove("pressed");
-            }
-        });
-    }
-}
 
 // Check if Web Bluetooth is supported
 if (!navigator.bluetooth) {
@@ -83,10 +115,8 @@ let server = null;
 let service = null;
 let txCharacteristic = null;
 let rxCharacteristic = null;
-let prev_report = new Uint8Array([128, 128, 128, 128, 0, 0]); // Updated to 6 bytes: neutral axes + no buttons
+let prev_report = new Uint8Array([0, 0, 15, 0, 0, 0, 0, 0, 0]);
 let output;
-let keepAliveCounter = 0;
-let connectionLostDetected = false;
 
 async function connect_ble() {
     try {
@@ -101,9 +131,6 @@ async function connect_ble() {
         });
 
         write(`Selected device: ${device.name || 'Unknown'}\n`);
-        
-        // Add disconnection event listener
-        device.addEventListener('gattserverdisconnected', onDisconnected);
         
         // Connect to GATT server
         server = await device.gatt.connect();
@@ -142,17 +169,7 @@ async function connect_ble() {
         document.getElementById("connect_ble").style.display = "none";
         document.getElementById("disconnect_ble").style.display = "inline";
         
-        // Reset connection state
-        connectionLostDetected = false;
-        keepAliveCounter = 0;
-        
-        write("BLE connection established!\n");
-        
-        // Send initial data immediately to establish communication
-        write("Sending initial gamepad data...\n");
-        const initialReport = new Uint8Array([0, 0, 15, 128, 128, 128, 128, 0]); // Neutral state
-        await send_report(initialReport);
-        write("Initial data sent successfully!\n\n");
+        write("BLE connection established!\n\n");
         
     } catch (error) {
         write(`Error: ${error.message}\n`);
@@ -170,39 +187,11 @@ async function connect_ble() {
     }
 }
 
-function onDisconnected() {
-    write("Device disconnected unexpectedly!\n");
-    connectionLostDetected = true;
-    
-    // Clean up connection state
-    server = null;
-    service = null;
-    txCharacteristic = null;
-    rxCharacteristic = null;
-    
-    // Update UI
-    document.getElementById("connect_ble").style.display = "inline";
-    document.getElementById("disconnect_ble").style.display = "none";
-    
-    // Auto-reconnect after 2 seconds
-    setTimeout(() => {
-        if (device && connectionLostDetected) {
-            write("Attempting to reconnect...\n");
-            connect_ble();
-        }
-    }, 2000);
-}
-
 async function disconnect_ble() {
     try {
-        connectionLostDetected = false; // Prevent auto-reconnect
-        
         if (rxCharacteristic) {
             await rxCharacteristic.stopNotifications();
             rxCharacteristic.removeEventListener('characteristicvaluechanged', handleNotification);
-        }
-        if (device) {
-            device.removeEventListener('gattserverdisconnected', onDisconnected);
         }
         if (server && server.connected) {
             server.disconnect();
@@ -280,43 +269,34 @@ function send_escaped_byte(b) {
 }
 
 async function send_report(report) {
-    if (!server || !server.connected || !txCharacteristic || connectionLostDetected) {
+    if (!server || !server.connected || !txCharacteristic) {
         return;
     }
 
-    try {
-        let data = new Uint8Array(4 + 6 + 4);  // Changed from 8 to 6 bytes for report
-        data[0] = 1;    // protocol_version
-        data[1] = 0;    // descriptor_number (use virtual gamepad descriptor)
-        data[2] = 6;    // length (changed from 8 to 6)
-        data[3] = 1;    // report_id (changed from 0 to 1 to match virtual gamepad)
-        data.set(report, 4);
-        const crc = crc32(new DataView(data.buffer), 10);  // Changed from 12 to 10
-        data[10] = (crc >> 0) & 0xFF;   // Changed indices
-        data[11] = (crc >> 8) & 0xFF;
-        data[12] = (crc >> 16) & 0xFF;
-        data[13] = (crc >> 24) & 0xFF;
+    let data = new Uint8Array(4 + 8 + 4);
+    data[0] = 1;
+    data[1] = 2;
+    data[2] = 8;
+    data[3] = 0;
+    data.set(report, 4);
+    const crc = crc32(new DataView(data.buffer), 12);
+    data[12] = (crc >> 0) & 0xFF;
+    data[13] = (crc >> 8) & 0xFF;
+    data[14] = (crc >> 16) & 0xFF;
+    data[15] = (crc >> 24) & 0xFF;
 
-        ble_write(END);
-        for (let i = 0; i < 14; i++) {  // Changed from 16 to 14
-            send_escaped_byte(data[i]);
-        }
-        ble_write(END);
-        await flush();
-    } catch (error) {
-        write(`Send error: ${error.message}\n`);
-        console.error('BLE send error:', error);
-        // Connection might be lost
-        if (error.name === 'NetworkError' || error.name === 'NotConnectedError') {
-            connectionLostDetected = true;
-        }
+    ble_write(END);
+    for (let i = 0; i < 16; i++) {
+        send_escaped_byte(data[i]);
     }
+    ble_write(END);
+    await flush();
 }
 
 async function loop() {
     try {
         clear_output();
-        if (server && server.connected && !connectionLostDetected) {
+        if (server && server.connected) {
             write(`BLE CONNECTED (${device.name || 'Unknown'})\n\n`);
         } else {
             write("BLE NOT CONNECTED\n\n");
@@ -340,7 +320,7 @@ async function loop() {
         let dpad_right = false;
         let dpad_up = false;
         let dpad_down = false;
-        let lx = 128;  // Center stick positions
+        let lx = 128;
         let ly = 128;
         let rx = 128;
         let ry = 128;
@@ -362,29 +342,27 @@ async function loop() {
                     write(" ");
                 }
                 write("\n");
-                b |= gamepad.buttons[0].value;
-                a |= gamepad.buttons[1].value;
-                y |= gamepad.buttons[2].value;
-                x |= gamepad.buttons[3].value;
-                l |= gamepad.buttons[4].value;
-                r |= gamepad.buttons[5].value;
+                b |= gamepad.buttons[0].pressed;
+                a |= gamepad.buttons[1].pressed;
+                y |= gamepad.buttons[2].pressed;
+                x |= gamepad.buttons[3].pressed;
+                l |= gamepad.buttons[4].pressed;
+                r |= gamepad.buttons[5].pressed;
                 zl |= gamepad.buttons[6].value > 0.25;
                 zr |= gamepad.buttons[7].value > 0.25;
-                minus |= gamepad.buttons[8].value;
-                plus |= gamepad.buttons[9].value;
-                ls |= gamepad.buttons[10].value;
-                rs |= gamepad.buttons[11].value;
-                home |= gamepad.buttons[16].value;
-                dpad_up |= gamepad.buttons[12].value;
-                dpad_down |= gamepad.buttons[13].value;
-                dpad_left |= gamepad.buttons[14].value;
-                dpad_right |= gamepad.buttons[15].value;
-                
-                // Fix stick calculation - don't accumulate, convert from -1.0..1.0 to 0..255
-                lx = Math.max(0, Math.min(255, Math.round(128 + gamepad.axes[0] * 127)));
-                ly = Math.max(0, Math.min(255, Math.round(128 + gamepad.axes[1] * 127)));
-                rx = Math.max(0, Math.min(255, Math.round(128 + gamepad.axes[2] * 127)));
-                ry = Math.max(0, Math.min(255, Math.round(128 + gamepad.axes[3] * 127)));
+                minus |= gamepad.buttons[8].pressed;
+                plus |= gamepad.buttons[9].pressed;
+                ls |= gamepad.buttons[10].pressed;
+                rs |= gamepad.buttons[11].pressed;
+                home |= gamepad.buttons[16].pressed;
+                dpad_up |= gamepad.buttons[12].pressed;
+                dpad_down |= gamepad.buttons[13].pressed;
+                dpad_left |= gamepad.buttons[14].pressed;
+                dpad_right |= gamepad.buttons[15].pressed;
+                lx = Math.max(0, Math.min(255, 128 + gamepad.axes[0] * 128));
+                ly = Math.max(0, Math.min(255, 128 + gamepad.axes[1] * 128));
+                rx = Math.max(0, Math.min(255, 128 + gamepad.axes[2] * 128));
+                ry = Math.max(0, Math.min(255, 128 + gamepad.axes[3] * 128));
             } else {
                 write("IGNORED\n");
             }
@@ -403,71 +381,88 @@ async function loop() {
         minus |= virtualButtons.minus;
         plus |= virtualButtons.plus;
         home |= virtualButtons.home;
+        ls |= virtualButtons.ls;
+        rs |= virtualButtons.rs;
         dpad_up |= virtualButtons.dpad_up;
         dpad_down |= virtualButtons.dpad_down;
         dpad_left |= virtualButtons.dpad_left;
         dpad_right |= virtualButtons.dpad_right;
         
+        // Include virtual analog stick values (only if no physical gamepad is moving them)
+        if (navigator.getGamepads().every(gamepad => !gamepad || gamepad.mapping !== 'standard' || gamepad.id.includes('HID Receiver'))) {
+            lx = virtualSticks.lx;
+            ly = virtualSticks.ly;
+            rx = virtualSticks.rx;
+            ry = virtualSticks.ry;
+        }
+        
         // Show virtual button status
-        let virtualPressed = [];
-        for (const [key, value] of Object.entries(virtualButtons)) {
-            if (value) virtualPressed.push(key.toUpperCase());
+        if (virtualButtons.a) {
+            write("VIRTUAL: Button A PRESSED\n");
         }
-        if (virtualPressed.length > 0) {
-            write(`VIRTUAL: ${virtualPressed.join(', ')} PRESSED\n`);
+        if (virtualButtons.b) {
+            write("VIRTUAL: Button B PRESSED\n");
+        }
+        if (virtualButtons.x) {
+            write("VIRTUAL: Button X PRESSED\n");
+        }
+        if (virtualButtons.y) {
+            write("VIRTUAL: Button Y PRESSED\n");
+        }
+        if (virtualButtons.l) {
+            write("VIRTUAL: Button L PRESSED\n");
+        }
+        if (virtualButtons.r) {
+            write("VIRTUAL: Button R PRESSED\n");
+        }
+        if (virtualButtons.zl) {
+            write("VIRTUAL: Button ZL PRESSED\n");
+        }
+        if (virtualButtons.zr) {
+            write("VIRTUAL: Button ZR PRESSED\n");
+        }
+        if (virtualButtons.minus) {
+            write("VIRTUAL: Button MINUS PRESSED\n");
+        }
+        if (virtualButtons.plus) {
+            write("VIRTUAL: Button PLUS PRESSED\n");
+        }
+        if (virtualButtons.home) {
+            write("VIRTUAL: Button HOME PRESSED\n");
+        }
+        if (virtualButtons.dpad_up) {
+            write("VIRTUAL: D-Pad UP PRESSED\n");
+        }
+        if (virtualButtons.dpad_down) {
+            write("VIRTUAL: D-Pad DOWN PRESSED\n");
+        }
+        if (virtualButtons.dpad_left) {
+            write("VIRTUAL: D-Pad LEFT PRESSED\n");
+        }
+        if (virtualButtons.dpad_right) {
+            write("VIRTUAL: D-Pad RIGHT PRESSED\n");
         }
 
-        let report = new Uint8Array(6);  // Changed from 8 to 6 bytes
+        let report = new Uint8Array(8);
 
-        // Virtual gamepad format:
-        // Byte 0: X axis (left stick X)
-        // Byte 1: Y axis (left stick Y) 
-        // Byte 2: Z axis (right stick X)
-        // Byte 3: Rz axis (right stick Y)
-        // Byte 4-5: 16 buttons packed into 2 bytes
-
-        report[0] = lx;   // X axis
-        report[1] = ly;   // Y axis  
-        report[2] = rx;   // Z axis
-        report[3] = ry;   // Rz axis
-
-        // Pack 16 buttons into 2 bytes
-        // Buttons 0-7 in byte 4, buttons 8-15 in byte 5
-        let buttons_low = (a ? 1 : 0) | (b ? 2 : 0) | (x ? 4 : 0) | (y ? 8 : 0) | 
-                         (l ? 16 : 0) | (r ? 32 : 0) | (zl ? 64 : 0) | (zr ? 128 : 0);
-        
-        let buttons_high = (minus ? 1 : 0) | (plus ? 2 : 0) | (ls ? 4 : 0) | (rs ? 8 : 0) | 
-                          (home ? 16 : 0) | (capture ? 32 : 0) |
-                          (dpad_up ? 64 : 0) | (dpad_down ? 128 : 0);
-        
-        // Handle d-pad left/right by combining with other buttons or using different mapping
-        // Since we only have 16 buttons total, map dpad_left to ls and dpad_right to rs if not already used
-        if (dpad_left && !ls) buttons_high |= 4;   // Use ls bit if not already pressed
-        if (dpad_right && !rs) buttons_high |= 8;  // Use rs bit if not already pressed
-        
-        report[4] = buttons_low;
-        report[5] = buttons_high;
+        report[0] = (y << 0) | (b << 1) | (a << 2) | (x << 3) | (l << 4) | (r << 5) | (zl << 6) | (zr << 7);
+        report[1] = (minus << 0) | (plus << 1) | (ls << 2) | (rs << 3) | (home << 4) | (capture << 5);
+        report[2] = dpad_lut[(dpad_left << 0) | (dpad_right << 1) | (dpad_up << 2) | (dpad_down << 3)];
+        report[3] = Math.max(0, Math.min(255, lx));
+        report[4] = Math.max(0, Math.min(255, ly));
+        report[5] = Math.max(0, Math.min(255, rx));
+        report[6] = Math.max(0, Math.min(255, ry));
 
         write("OUTPUT\n");
-        for (let i = 0; i < 6; i++) {  // Changed from 8 to 6
+        for (let i = 0; i < 8; i++) {
             write(report[i].toString(16).padStart(2, '0'));
             write(" ");
         }
         write("\n");
 
-        // Send data regularly to keep connection alive
-        // Send every 3 seconds (375 loops × 8ms) to stay within the 4-second receiver timeout
-        keepAliveCounter++;
-        const shouldSendKeepAlive = keepAliveCounter >= 375; // ~3 seconds
-        
-        if (!reports_equal(prev_report, report) || shouldSendKeepAlive) {
+        if (!reports_equal(prev_report, report)) {
             await send_report(report);
-            prev_report = new Uint8Array(report); // Create a copy
-            
-            if (shouldSendKeepAlive) {
-                write("Keep-alive data sent (3s interval)\n");
-                keepAliveCounter = 0;
-            }
+            prev_report = report;
         }
     } catch (e) {
         console.log(e);

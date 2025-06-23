@@ -588,32 +588,38 @@ static void peripheral_mode_init(void) {
     // that matches what the transmitter is sending. Use a standard gamepad descriptor
     // that should work with most common input formats.
     
-    // Use HID standard gamepad descriptor for the virtual transmitter
+    // Nintendo Switch Pro Controller compatible descriptor for 8-byte reports
     const uint8_t virtual_gamepad_descriptor[] = {
         0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
         0x09, 0x05,        // Usage (Game Pad)
         0xa1, 0x01,        // Collection (Application)
-        0x85, 0x01,        //   Report ID (1)
-        0x09, 0x01,        //   Usage (Pointer)
-        0xa1, 0x00,        //   Collection (Physical)
-        0x09, 0x30,        //     Usage (X)
-        0x09, 0x31,        //     Usage (Y)
-        0x09, 0x32,        //     Usage (Z)
-        0x09, 0x35,        //     Usage (Rz)
-        0x15, 0x00,        //     Logical Minimum (0)
-        0x26, 0xff, 0x00,  //     Logical Maximum (255)
-        0x75, 0x08,        //     Report Size (8)
-        0x95, 0x04,        //     Report Count (4)
-        0x81, 0x02,        //     Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0xc0,              //   End Collection
+        // Note: No Report ID specified = Report ID 0 (matches transmitter)
         0x05, 0x09,        //   Usage Page (Button)
         0x19, 0x01,        //   Usage Minimum (0x01)
         0x29, 0x10,        //   Usage Maximum (0x10)
         0x15, 0x00,        //   Logical Minimum (0)
         0x25, 0x01,        //   Logical Maximum (1)
         0x75, 0x01,        //   Report Size (1)
-        0x95, 0x10,        //   Report Count (16)
+        0x95, 0x10,        //   Report Count (16) - 2 bytes of buttons
         0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+        0x09, 0x39,        //   Usage (Hat switch) - D-pad
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x0F,        //   Logical Maximum (15)
+        0x75, 0x08,        //   Report Size (8)
+        0x95, 0x01,        //   Report Count (1)
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x09, 0x30,        //   Usage (X) - Left stick X
+        0x09, 0x31,        //   Usage (Y) - Left stick Y
+        0x09, 0x32,        //   Usage (Z) - Right stick X
+        0x09, 0x35,        //   Usage (Rz) - Right stick Y
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x26, 0xff, 0x00,  //   Logical Maximum (255)
+        0x75, 0x08,        //   Report Size (8)
+        0x95, 0x04,        //   Report Count (4) - 4 axes
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x95, 0x01,        //   Report Count (1) - 1 padding byte
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
         0xc0,              // End Collection
     };
     
@@ -661,20 +667,25 @@ static void start_peripheral_advertising(void) {
 
 static void handle_received_packet(const uint8_t* data, uint16_t len) {
     if (len < sizeof(packet_t)) {
-        LOG_WRN("Packet too small: %d", len);
+        LOG_WRN("Packet too small: %d < %d", len, sizeof(packet_t));
         return;
     }
     
     packet_t* msg = (packet_t*) data;
-    len = len - sizeof(packet_t);
+    uint16_t payload_len = len - sizeof(packet_t);
+    
+    LOG_DBG("Packet validation: proto=%d (expect %d), len=%d, payload=%d, desc=%d, report_id=%d", 
+            msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
+            msg->our_descriptor_number, msg->report_id);
     
     if ((msg->protocol_version != PROTOCOL_VERSION) ||
-        (msg->len != len) ||
-        (len > 64) ||
+        (msg->len != payload_len) ||
+        (payload_len > 64) ||
         (msg->our_descriptor_number >= NOUR_DESCRIPTORS) ||
-        ((msg->report_id == 0) && (len >= 64))) {
-        LOG_WRN("Invalid packet: proto=%d, len=%d, desc=%d, report_id=%d", 
-                msg->protocol_version, msg->len, msg->our_descriptor_number, msg->report_id);
+        ((msg->report_id == 0) && (payload_len >= 64))) {
+        LOG_WRN("Invalid packet: proto=%d (expect %d), len=%d vs %d, desc=%d (max %d), report_id=%d", 
+                msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
+                msg->our_descriptor_number, NOUR_DESCRIPTORS, msg->report_id);
         return;
     }
     
@@ -722,12 +733,15 @@ static void process_byte_with_framing(uint8_t c) {
             case END:
                 if (bytes_read > 4) {
                     uint32_t crc = crc32(packet_buffer, bytes_read - 4);
-                    uint32_t received_crc = 0;
-                    for (int i = 0; i < 4; i++) {
-                        received_crc = (received_crc << 8) | packet_buffer[bytes_read - 1 - i];
-                    }
+                    // Read CRC in little-endian format (matches transmitter)
+                    uint32_t received_crc = 
+                        (packet_buffer[bytes_read - 4] << 0) |
+                        (packet_buffer[bytes_read - 3] << 8) |
+                        (packet_buffer[bytes_read - 2] << 16) |
+                        (packet_buffer[bytes_read - 1] << 24);
                     if (crc == received_crc) {
                         handle_received_packet(packet_buffer, bytes_read - 4);
+                        LOG_DBG("Packet received successfully, CRC: 0x%08X", crc);
                     } else {
                         LOG_WRN("CRC error: expected 0x%08X, got 0x%08X", crc, received_crc);
                     }
@@ -746,6 +760,7 @@ static void process_byte_with_framing(uint8_t c) {
 
 static void process_peripheral_command(uint8_t* buf, int count) {
     // Process each byte with SLIP-like framing
+    LOG_DBG("Received %d bytes from BLE", count);
     for (int i = 0; i < count; i++) {
         process_byte_with_framing(buf[i]);
     }
@@ -1341,6 +1356,15 @@ int main() {
             if (their_descriptor_updated) {
                 update_their_descriptor_derivates();
                 their_descriptor_updated = false;
+            }
+        }
+        
+        // Peripheral mode functionality - process reports from BLE transmitter
+        if (current_mode == MODE_PERIPHERAL) {
+            // In peripheral mode, we also need to process periodic ticks for remapping
+            if (atomic_test_and_clear_bit(tick_pending, 0)) {
+                process_mapping(true);
+                process_pending = false;
             }
         }
         if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
