@@ -70,6 +70,31 @@ typedef struct __attribute__((packed)) {
     uint8_t data[0];
 } packet_t;
 
+// Add after the packet structure definitions
+typedef struct {
+    uint8_t report_id;
+    uint8_t len;
+    uint8_t data[64];
+} outgoing_report_t;
+
+#define OR_BUFSIZE 8
+static outgoing_report_t outgoing_reports[OR_BUFSIZE];
+static uint8_t or_head = 0;
+static uint8_t or_tail = 0;
+static uint8_t or_items = 0;
+
+static void queue_outgoing_report(uint8_t report_id, uint8_t* data, uint8_t len) {
+    if (or_items == OR_BUFSIZE) {
+        LOG_WRN("Report queue overflow!");
+        return;
+    }
+    outgoing_reports[or_tail].report_id = report_id;
+    outgoing_reports[or_tail].len = len;
+    memcpy(outgoing_reports[or_tail].data, data, len);
+    or_tail = (or_tail + 1) % OR_BUFSIZE;
+    or_items++;
+}
+
 // Packet buffer and state for SLIP-like framing
 static uint8_t packet_buffer[SERIAL_MAX_PACKET_SIZE];
 static uint16_t bytes_read = 0;
@@ -555,18 +580,52 @@ static void peripheral_mode_init(void) {
     bytes_read = 0;
     escaped = false;
     
-    // Create a virtual device that can handle the packet protocol
-    // Use the current our_descriptor_number configuration
+    // Create a virtual transmitter device that represents the input source
+    // This should match the descriptor of the device that's transmitting to us
     uint16_t virtual_interface = 0xFF00;
     
-    // Parse the appropriate descriptor based on our_descriptor_number
-    if (our_descriptor_number < NOUR_DESCRIPTORS) {
-        parse_descriptor(0xCAFE, 0xBABE, 
-                        our_descriptors[our_descriptor_number].descriptor, 
-                        our_descriptors[our_descriptor_number].descriptor_length, 
-                        virtual_interface, 0);
-        device_connected_callback(virtual_interface, 0xCAFE, 0xBABE, 0);
-    }
+    // For peripheral mode, we need to set up a virtual input device descriptor
+    // that matches what the transmitter is sending. Use a standard gamepad descriptor
+    // that should work with most common input formats.
+    
+    // Use HID standard gamepad descriptor for the virtual transmitter
+    const uint8_t virtual_gamepad_descriptor[] = {
+        0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
+        0x09, 0x05,        // Usage (Game Pad)
+        0xa1, 0x01,        // Collection (Application)
+        0x85, 0x01,        //   Report ID (1)
+        0x09, 0x01,        //   Usage (Pointer)
+        0xa1, 0x00,        //   Collection (Physical)
+        0x09, 0x30,        //     Usage (X)
+        0x09, 0x31,        //     Usage (Y)
+        0x09, 0x32,        //     Usage (Z)
+        0x09, 0x35,        //     Usage (Rz)
+        0x15, 0x00,        //     Logical Minimum (0)
+        0x26, 0xff, 0x00,  //     Logical Maximum (255)
+        0x75, 0x08,        //     Report Size (8)
+        0x95, 0x04,        //     Report Count (4)
+        0x81, 0x02,        //     Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0xc0,              //   End Collection
+        0x05, 0x09,        //   Usage Page (Button)
+        0x19, 0x01,        //   Usage Minimum (0x01)
+        0x29, 0x10,        //   Usage Maximum (0x10)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x75, 0x01,        //   Report Size (1)
+        0x95, 0x10,        //   Report Count (16)
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0xc0,              // End Collection
+    };
+    
+    // Parse the virtual transmitter descriptor
+    parse_descriptor(0xCAFE, 0xBABE, 
+                    virtual_gamepad_descriptor, 
+                    sizeof(virtual_gamepad_descriptor), 
+                    virtual_interface, 0);
+    device_connected_callback(virtual_interface, 0xCAFE, 0xBABE, 0);
+    
+    // Force update of their descriptor derivates for the virtual device
+    their_descriptor_updated = true;
     
     // Set LED to indicate peripheral mode (blinking = advertising/waiting for connection)
     set_led_mode(LedMode::BLINK);
@@ -574,7 +633,7 @@ static void peripheral_mode_init(void) {
     // Start advertising
     start_peripheral_advertising();
     
-    LOG_INF("Peripheral mode initialized with packet protocol (descriptor %d)", our_descriptor_number);
+    LOG_INF("Peripheral mode initialized with virtual gamepad descriptor");
 }
 
 static void start_peripheral_advertising(void) {
@@ -622,19 +681,22 @@ static void handle_received_packet(const uint8_t* data, uint16_t len) {
     // Handle descriptor change
     if (msg->our_descriptor_number != our_descriptor_number) {
         our_descriptor_number = msg->our_descriptor_number;
-        // Persist config if needed
+        
+        // Signal that configuration needs to be updated
+        config_updated = true;
+        
         LOG_INF("Descriptor number changed to %d", our_descriptor_number);
     }
     
-    // Create HID report with report ID
+    // Create HID report with report ID for the remapper system
     uint8_t report[65];
     report[0] = msg->report_id;
     memcpy(report + 1, msg->data, len);
     
-    // Inject into HID remapper system
+    // Inject into HID remapper system which will handle the actual sending
     handle_received_report(report, len + 1, 0xFF00, msg->report_id);
     
-    LOG_INF("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
+    LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
             msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
 }
 
@@ -1027,7 +1089,16 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
         len--;
     }
     if (interface == 0) {
-        return CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL));
+        // Try to send immediately
+        if (CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL))) {
+            return true;
+        } else {
+            // Failed to send, queue it
+            if (len > 0) {
+                queue_outgoing_report(report_with_id[0], (uint8_t*)(report_with_id + 1), len - 1);
+            }
+            return false;
+        }
     }
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
@@ -1280,6 +1351,23 @@ int main() {
         if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
             if (!send_monitor_report(do_send_report)) {
                 k_sem_give(&usb_sem1);
+            }
+        }
+
+        // Process queued outgoing reports when USB HID is ready
+        if ((or_items > 0) && (k_sem_take(&usb_sem0, K_NO_WAIT) == 0)) {
+            uint8_t report_with_id[65];
+            report_with_id[0] = outgoing_reports[or_head].report_id;
+            memcpy(report_with_id + 1, outgoing_reports[or_head].data, outgoing_reports[or_head].len);
+            
+            if (do_send_report(0, report_with_id, outgoing_reports[or_head].len + 1)) {
+                // Successfully sent, remove from queue
+                // Semaphore will be released by USB callback
+                or_head = (or_head + 1) % OR_BUFSIZE;
+                or_items--;
+            } else {
+                // Failed to send, give back semaphore
+                k_sem_give(&usb_sem0);
             }
         }
 

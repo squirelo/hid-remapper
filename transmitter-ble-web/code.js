@@ -83,7 +83,7 @@ let server = null;
 let service = null;
 let txCharacteristic = null;
 let rxCharacteristic = null;
-let prev_report = new Uint8Array([0, 0, 15, 0, 0, 0, 0, 0]);
+let prev_report = new Uint8Array([128, 128, 128, 128, 0, 0]); // Updated to 6 bytes: neutral axes + no buttons
 let output;
 let keepAliveCounter = 0;
 let connectionLostDetected = false;
@@ -285,20 +285,20 @@ async function send_report(report) {
     }
 
     try {
-        let data = new Uint8Array(4 + 8 + 4);
+        let data = new Uint8Array(4 + 6 + 4);  // Changed from 8 to 6 bytes for report
         data[0] = 1;    // protocol_version
-        data[1] = 2;    // descriptor_number (Switch gamepad)
-        data[2] = 8;    // length
-        data[3] = 0;    // report_id
+        data[1] = 0;    // descriptor_number (use virtual gamepad descriptor)
+        data[2] = 6;    // length (changed from 8 to 6)
+        data[3] = 1;    // report_id (changed from 0 to 1 to match virtual gamepad)
         data.set(report, 4);
-        const crc = crc32(new DataView(data.buffer), 12);
-        data[12] = (crc >> 0) & 0xFF;
-        data[13] = (crc >> 8) & 0xFF;
-        data[14] = (crc >> 16) & 0xFF;
-        data[15] = (crc >> 24) & 0xFF;
+        const crc = crc32(new DataView(data.buffer), 10);  // Changed from 12 to 10
+        data[10] = (crc >> 0) & 0xFF;   // Changed indices
+        data[11] = (crc >> 8) & 0xFF;
+        data[12] = (crc >> 16) & 0xFF;
+        data[13] = (crc >> 24) & 0xFF;
 
         ble_write(END);
-        for (let i = 0; i < 16; i++) {
+        for (let i = 0; i < 14; i++) {  // Changed from 16 to 14
             send_escaped_byte(data[i]);
         }
         ble_write(END);
@@ -417,32 +417,39 @@ async function loop() {
             write(`VIRTUAL: ${virtualPressed.join(', ')} PRESSED\n`);
         }
 
-        let report = new Uint8Array(8);
+        let report = new Uint8Array(6);  // Changed from 8 to 6 bytes
 
-        // Switch Pro Controller button layout:
-        // Byte 0: Y|B|A|X|L|R|ZL|ZR
-        // Byte 1: MINUS|PLUS|LS|RS|HOME|CAPTURE|0|0
-        // Byte 2: D-pad (hat switch value)
-        // Byte 3: LX (left stick X)
-        // Byte 4: LY (left stick Y) 
-        // Byte 5: RX (right stick X)
-        // Byte 6: RY (right stick Y)
-        // Byte 7: Reserved (0x00)
+        // Virtual gamepad format:
+        // Byte 0: X axis (left stick X)
+        // Byte 1: Y axis (left stick Y) 
+        // Byte 2: Z axis (right stick X)
+        // Byte 3: Rz axis (right stick Y)
+        // Byte 4-5: 16 buttons packed into 2 bytes
 
-        report[0] = (y ? 1 : 0) | (b ? 2 : 0) | (a ? 4 : 0) | (x ? 8 : 0) | 
-                   (l ? 16 : 0) | (r ? 32 : 0) | (zl ? 64 : 0) | (zr ? 128 : 0);
-        report[1] = (minus ? 1 : 0) | (plus ? 2 : 0) | (ls ? 4 : 0) | (rs ? 8 : 0) | 
-                   (home ? 16 : 0) | (capture ? 32 : 0);
-        report[2] = dpad_lut[(dpad_left ? 1 : 0) | (dpad_right ? 2 : 0) | 
-                            (dpad_up ? 4 : 0) | (dpad_down ? 8 : 0)];
-        report[3] = lx;
-        report[4] = ly;
-        report[5] = rx;
-        report[6] = ry;
-        report[7] = 0; // Reserved byte
+        report[0] = lx;   // X axis
+        report[1] = ly;   // Y axis  
+        report[2] = rx;   // Z axis
+        report[3] = ry;   // Rz axis
+
+        // Pack 16 buttons into 2 bytes
+        // Buttons 0-7 in byte 4, buttons 8-15 in byte 5
+        let buttons_low = (a ? 1 : 0) | (b ? 2 : 0) | (x ? 4 : 0) | (y ? 8 : 0) | 
+                         (l ? 16 : 0) | (r ? 32 : 0) | (zl ? 64 : 0) | (zr ? 128 : 0);
+        
+        let buttons_high = (minus ? 1 : 0) | (plus ? 2 : 0) | (ls ? 4 : 0) | (rs ? 8 : 0) | 
+                          (home ? 16 : 0) | (capture ? 32 : 0) |
+                          (dpad_up ? 64 : 0) | (dpad_down ? 128 : 0);
+        
+        // Handle d-pad left/right by combining with other buttons or using different mapping
+        // Since we only have 16 buttons total, map dpad_left to ls and dpad_right to rs if not already used
+        if (dpad_left && !ls) buttons_high |= 4;   // Use ls bit if not already pressed
+        if (dpad_right && !rs) buttons_high |= 8;  // Use rs bit if not already pressed
+        
+        report[4] = buttons_low;
+        report[5] = buttons_high;
 
         write("OUTPUT\n");
-        for (let i = 0; i < 8; i++) {
+        for (let i = 0; i < 6; i++) {  // Changed from 8 to 6
             write(report[i].toString(16).padStart(2, '0'));
             write(" ");
         }
