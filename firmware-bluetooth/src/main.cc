@@ -878,13 +878,8 @@ static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t l
 }
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
-    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", 
-            param->interval_min, param->interval_max, param->latency, param->timeout);
-    if (param->interval_min < 6) param->interval_min = 6;     // Minimum 7.5ms (esports-grade)
-    if (param->interval_max > 24) param->interval_max = 24;   // Cap at 30ms to prevent 1s+ intervals
-    if (param->timeout < 100) param->timeout = 100;          // Minimum 1s timeout
-    if (param->timeout > 3200) param->timeout = 3200;        // Maximum 32s timeout
-    
+    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", param->interval_min, param->interval_max, param->latency, param->timeout);
+    param->interval_max = param->interval_min;
     return true;
 }
 
@@ -1143,8 +1138,8 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
         report_with_id++;
         len--;
     }
-     
-    // OPTIMIZATION 7: Queue USB writes to prevent blocking on flow control stalls
+
+    // Queue USB writes to prevent blocking on flow control stalls
     usb_hid_msg_t msg;
     msg.interface = interface;
     msg.len = len;
