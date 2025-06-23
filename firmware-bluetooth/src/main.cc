@@ -32,13 +32,9 @@ LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
 #define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
 
-// Peripheral mode support
-enum operation_mode {
-    MODE_HOST = 0,
-    MODE_PERIPHERAL = 1
-};
-
-static enum operation_mode current_mode = MODE_PERIPHERAL;
+// Both modes active simultaneously
+static bool host_mode_enabled = true;   // Always start enabled
+static bool peripheral_mode_enabled = true;
 
 // Nordic UART Service UUID - using standard Nordic UUIDs for Web Bluetooth compatibility
 static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
@@ -104,6 +100,8 @@ static void peripheral_mode_init(void);
 static void process_peripheral_command(uint8_t* buf, int count);
 static void start_peripheral_advertising(void);
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
+static void update_led_status(void);
+static void enable_dual_mode(void);
 
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
@@ -211,6 +209,10 @@ static bool peers_only = true;
 
 static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(12, 24, 0, 3000);
 
+// Coordination flags for peripheral-host mode interaction
+static volatile bool request_scan_stop = false;
+static volatile bool request_scan_resume = false;
+
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
 }
@@ -269,11 +271,13 @@ static void set_led_mode(LedMode led_mode_) {
     }
 }
 
+
+
 // Peripheral mode callbacks
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
-    if (current_mode == MODE_PERIPHERAL) {
+    if (peripheral_mode_enabled) {
         process_peripheral_command((uint8_t*)buf, len);
     }
     return len;
@@ -292,38 +296,39 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
     
-    if (current_mode == MODE_PERIPHERAL) {
+    if (peripheral_mode_enabled) {
         peripheral_conn = bt_conn_ref(conn);
         LOG_INF("Peripheral connected");
-        set_led_mode(LedMode::ON);
+        update_led_status();
         
-        // Request stable connection parameters for peripheral mode
-        struct bt_le_conn_param param = {
-            .interval_min = 12,  // 15ms minimum
-            .interval_max = 24,  // 30ms maximum  
-            .latency = 0,        // No latency for real-time data
-            .timeout = 3000      // 30 second timeout
-        };
-        
-        int ret = bt_conn_le_param_update(conn, &param);
-        if (ret) {
-            LOG_WRN("Failed to update connection parameters: %d", ret);
-        } else {
-            LOG_INF("Requested stable connection parameters");
+        // CRITICAL FIX: Stop host scanning when peripheral connects to prevent interference
+        if (host_mode_enabled && scanning) {
+            LOG_INF("Stopping host scanning to avoid peripheral interference");
+            request_scan_stop = true;
         }
+        
+        // Don't aggressively update connection parameters - let them stabilize
+        // The original working version didn't force parameter updates
+        LOG_INF("Peripheral connection established successfully");
     }
 }
 
 static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    if (current_mode == MODE_PERIPHERAL && conn == peripheral_conn) {
+    if (peripheral_mode_enabled && conn == peripheral_conn) {
         LOG_INF("Peripheral disconnected (reason %u)", reason);
         bt_conn_unref(peripheral_conn);
         peripheral_conn = NULL;
-        set_led_mode(LedMode::BLINK);
+        update_led_status();
         
         // Restart advertising
         start_peripheral_advertising();
+        
+        // CRITICAL FIX: Resume host scanning when peripheral disconnects
+        if (host_mode_enabled && !scanning) {
+            LOG_INF("Resuming host scanning after peripheral disconnect");
+            request_scan_resume = true;
+        }
     }
 }
 
@@ -366,6 +371,34 @@ static int count_connections() {
     return conn_count;
 }
 
+static void update_led_status() {
+    // LED status indication for dual mode:
+    // Solid ON: Both modes active with connections
+    // Fast blink: Host scanning or peripheral advertising
+    // Slow blink: Only one mode active
+    // OFF: No modes active (shouldn't happen normally)
+    
+    bool host_active = host_mode_enabled && (scanning || count_connections() > 0);
+    bool peripheral_active = peripheral_mode_enabled && (peripheral_conn != NULL);
+    
+    if (host_active && peripheral_active) {
+        // Both modes with connections - solid on
+        set_led_mode(LedMode::ON);
+    } else if (host_mode_enabled && peripheral_mode_enabled) {
+        // Both modes enabled but not all connected - fast blink
+        atomic_set(&led_blink_count, 2);  // Fast blink pattern
+        set_led_mode(LedMode::BLINK);
+    } else if (host_active || peripheral_active) {
+        // Only one mode active - slow blink
+        atomic_set(&led_blink_count, 1);  // Slow blink pattern
+        set_led_mode(LedMode::BLINK);
+    } else {
+        // No active connections - blink to show searching/advertising
+        atomic_set(&led_blink_count, 3);  // Different pattern for searching
+        set_led_mode(LedMode::BLINK);
+    }
+}
+
 static bool scan_setup_filters() {
     bt_scan_filter_remove_all();
 
@@ -400,9 +433,18 @@ static bool scan_setup_filters() {
 }
 
 static void scan_start_work_fn(struct k_work* work) {
-    // Don't scan aggressively when in peripheral mode to avoid interference
-    if (current_mode == MODE_PERIPHERAL && peripheral_conn) {
-        LOG_DBG("Skipping scan - peripheral mode with active connection");
+    // Don't scan if host mode is disabled
+    if (!host_mode_enabled) {
+        LOG_DBG("Skipping scan - host mode disabled");
+        return;
+    }
+    
+    // CRITICAL: Stop scanning when peripheral has active connection to avoid interference
+    if (peripheral_mode_enabled && peripheral_conn) {
+        LOG_DBG("Stopping scan - peripheral mode has active connection to avoid interference");
+        if (scanning) {
+            scan_stop();
+        }
         return;
     }
     
@@ -411,9 +453,9 @@ static void scan_start_work_fn(struct k_work* work) {
     }
     if (scan_setup_filters()) {
         scan_start();
-        set_led_mode(peers_only ? LedMode::BLINK : LedMode::ON);
+        update_led_status();
     } else {
-        set_led_mode(LedMode::BLINK);
+        update_led_status();
     }
 }
 static K_WORK_DELAYABLE_DEFINE(scan_start_work, scan_start_work_fn);
@@ -550,18 +592,12 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
         button_pressed_at = k_uptime_get();
     } else {
         if (k_uptime_get() - button_pressed_at > CLEAR_BONDS_BUTTON_PRESS_MS) {
+            // Long press: clear bonds
             clear_bonds();
         } else {
-            // Toggle between host and peripheral mode
-            if (current_mode == MODE_HOST) {
-                current_mode = MODE_PERIPHERAL;
-                LOG_INF("Switching to peripheral mode");
-                peripheral_mode_init();
-            } else {
-                current_mode = MODE_HOST;
-                LOG_INF("Switching to host mode");
-                pair_new_device();
-            }
+            // Short press: pair new device (host mode always enabled)
+            LOG_INF("Pairing new device");
+            pair_new_device();
         }
     }
 }
@@ -590,25 +626,27 @@ static int32_t virtual_gamepad_default_value(uint32_t usage) {
 
 // Peripheral mode implementation functions
 static void peripheral_mode_init(void) {
-    // Stop host mode scanning
-    if (scanning) {
-        scan_stop();
+    // Only stop scanning and disconnect if host mode is completely disabled
+    // When both modes are enabled, let them coexist
+    if (!host_mode_enabled) {
+        if (scanning) {
+            scan_stop();
+        }
+        bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     }
-    
-    // Disconnect any existing host connections
-    bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     
     // Initialize packet reception state
     bytes_read = 0;
     escaped = false;
     
     // Create a virtual transmitter device that represents the input source
-    // This should match the descriptor of the device that's transmitting to us
-    uint16_t virtual_interface = 0xFF00;  // Will be changed to actual interface after parsing
+    uint16_t virtual_interface = 0xFF00;  // Use proper interface 0x0000
     
-    // For peripheral mode, we need to set up a virtual input device descriptor
-    // that matches what the transmitter is sending. Use a standard gamepad descriptor
-    // that should work with most common input formats.
+    // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
+    // This prevents button offset issues where virtual device gets assigned index 8 
+    // and buttons appear as 9,10,11,12 instead of 1,2,3,4
+    interface_index_in_use = 0;
+    interface_index.clear();
     
     // Virtual gamepad descriptor with Report ID to match firmware format expectations
     static const uint8_t virtual_gamepad_descriptor[] = {
@@ -654,16 +692,6 @@ static void peripheral_mode_init(void) {
         0xC0,              // End Collection
     };
     
-    // Parse the virtual transmitter descriptor following horipad pattern
-    // Use interface 0 (like first real HID interface in host mode)
-    virtual_interface = 0x0000;  // Use proper interface 0x0000
-    
-    // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
-    // This prevents button offset issues where virtual device gets assigned index 8 
-    // and buttons appear as 9,10,11,12 instead of 1,2,3,4
-    interface_index_in_use = 0;
-    interface_index.clear();
-    
     parse_descriptor(0x0F0D, 0x00C1,  // Use horipad VID/PID as reference
                     virtual_gamepad_descriptor, 
                     sizeof(virtual_gamepad_descriptor), 
@@ -673,11 +701,10 @@ static void peripheral_mode_init(void) {
     // Force update of their descriptor derivates for the virtual device
     their_descriptor_updated = true;
     
-    // Set LED to indicate peripheral mode (blinking = advertising/waiting for connection)
-    set_led_mode(LedMode::BLINK);
-    
-    // Start advertising
-    start_peripheral_advertising();
+    // Start advertising if peripheral mode is enabled
+    if (peripheral_mode_enabled) {
+        start_peripheral_advertising();
+    }
     
     LOG_INF("Peripheral mode initialized with virtual gamepad descriptor");
 }
@@ -813,8 +840,8 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
-        // Only restart scanning if we're in host mode
-        if (current_mode == MODE_HOST) {
+        // Only restart scanning if host mode is enabled
+        if (host_mode_enabled) {
             k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
         }
         return;
@@ -843,8 +870,8 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     count_connections();
 
-    // Only restart scanning if we're in host mode
-    if (current_mode == MODE_HOST) {
+    // Only restart scanning if host mode is enabled
+    if (host_mode_enabled) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 }
@@ -857,8 +884,8 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
         peers_only = true;
-        // Only start discovery if we're in host mode
-        if (current_mode == MODE_HOST) {
+        // Only start discovery if host mode is enabled
+        if (host_mode_enabled) {
             gatt_discover(conn);
         }
     } else {
@@ -921,11 +948,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         return BT_GATT_ITER_STOP;
     }
 
-    // Don't aggressively restart scanning if we're in peripheral mode
-    if (scanning && current_mode != MODE_PERIPHERAL) {
+    // Manage scanning based on host mode status
+    if (scanning && host_mode_enabled) {
         scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
         k_work_submit(&scan_stop_work);
-    } else if (current_mode != MODE_PERIPHERAL) {
+    } else if (host_mode_enabled) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 
@@ -1299,6 +1326,58 @@ void clear_bonds() {
     k_work_submit(&clear_bonds_work);
 }
 
+void enable_host_mode() {
+    if (!host_mode_enabled) {
+        host_mode_enabled = true;
+        LOG_INF("Host mode enabled");
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
+}
+
+void disable_host_mode() {
+    if (host_mode_enabled) {
+        host_mode_enabled = false;
+        LOG_INF("Host mode disabled");
+        if (scanning) {
+            scan_stop();
+        }
+        // Disconnect host connections
+        bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
+    }
+}
+
+void enable_peripheral_mode() {
+    if (!peripheral_mode_enabled) {
+        peripheral_mode_enabled = true;
+        LOG_INF("Peripheral mode enabled");
+        peripheral_mode_init();
+    }
+}
+
+void disable_peripheral_mode() {
+    if (peripheral_mode_enabled) {
+        peripheral_mode_enabled = false;
+        LOG_INF("Peripheral mode disabled");
+        // Stop advertising
+        CHK(bt_le_adv_stop());
+        // Disconnect peripheral connection
+        if (peripheral_conn) {
+            CHK(bt_conn_disconnect(peripheral_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
+        }
+    }
+}
+
+void enable_dual_mode() {
+    // Enable both modes for full functionality
+    if (!peripheral_mode_enabled) {
+        enable_peripheral_mode();
+    }
+    if (!host_mode_enabled) {
+        enable_host_mode();
+    }
+    LOG_INF("Dual mode enabled - both host and peripheral active");
+}
+
 void my_mutexes_init() {
     for (int i = 0; i < (int8_t) MutexId::N; i++) {
         k_mutex_init(&mutexes[i]);
@@ -1352,12 +1431,17 @@ int main() {
     parse_our_descriptor();
     set_mapping_from_config();
 
-    // Start in the appropriate mode
-    if (current_mode == MODE_HOST) {
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-    } else {
+    // Initialize peripheral mode first (like original)
+    if (peripheral_mode_enabled) {
         peripheral_mode_init();
     }
+    
+    // Start host mode (always enabled)
+    if (host_mode_enabled) {
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
+    
+    LOG_INF("Initialization complete - dual mode active (peripheral:enabled, host:enabled)");
 
     struct report_type incoming_report;
     struct descriptor_type incoming_descriptor;
@@ -1366,17 +1450,14 @@ int main() {
     static uint8_t get_report_tmp_buf[64];
     bool process_pending = false;
     bool get_report_response_pending = false;
+    int64_t last_led_update = 0;
 
     while (true) {
-        // Host mode functionality
-        if (current_mode == MODE_HOST) {
+        // Host mode functionality - always process if enabled
+        if (host_mode_enabled) {
             if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
                 handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
                 process_pending = true;
-            }
-            if (atomic_test_and_clear_bit(tick_pending, 0)) {
-                process_mapping(true);
-                process_pending = false;
             }
 
             while (!k_msgq_get(&disconnected_q, &disconnected_item, K_NO_WAIT)) {
@@ -1395,13 +1476,29 @@ int main() {
             }
         }
         
-        // Peripheral mode functionality - process reports from BLE transmitter
-        if (current_mode == MODE_PERIPHERAL) {
-            // In peripheral mode, we also need to process periodic ticks for remapping
-            if (atomic_test_and_clear_bit(tick_pending, 0)) {
-                process_mapping(true);
-                process_pending = false;
-            }
+        // CRITICAL: Process peripheral-host coordination flags
+        if (request_scan_stop && scanning) {
+            LOG_INF("Processing scan stop request from peripheral connection");
+            scan_stop();
+            request_scan_stop = false;
+        }
+        if (request_scan_resume && !scanning && host_mode_enabled) {
+            LOG_INF("Processing scan resume request from peripheral disconnection");
+            k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+            request_scan_resume = false;
+        }
+        
+        // Process periodic ticks for remapping (needed for both modes)
+        if (atomic_test_and_clear_bit(tick_pending, 0)) {
+            process_mapping(true);
+            process_pending = false;
+        }
+        
+        // Update LED status periodically (every 5 seconds)
+        int64_t current_time = k_uptime_get();
+        if (current_time - last_led_update > 5000) {
+            update_led_status();
+            last_led_update = current_time;
         }
         if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
             if (!send_report(do_send_report)) {

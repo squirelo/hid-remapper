@@ -42,9 +42,17 @@ let virtualSticks = {
     ry: 128
 };
 
+// Gamepad forwarding state
+let gamepadForwardingEnabled = false;
+
 document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("connect_ble").addEventListener("click", connect_ble);
     document.getElementById("disconnect_ble").addEventListener("click", disconnect_ble);
+    
+    // Add event handler for gamepad forwarding toggle
+    document.getElementById("enable_gamepad").addEventListener("change", function(e) {
+        gamepadForwardingEnabled = e.target.checked;
+    });
     
     // Add event handlers for all virtual buttons
     const buttonMappings = {
@@ -325,48 +333,50 @@ async function loop() {
         let rx = 128;
         let ry = 128;
         
-        // Process physical gamepads
-        for (const gamepad of navigator.getGamepads()) {
-            if (!gamepad) {
-                continue;
-            }
-            write(gamepad.id);
-            write("\n");
-            if ((gamepad.mapping == 'standard') && !gamepad.id.includes('HID Receiver')) {
-                for (const b of gamepad.buttons) {
-                    write(b.value);
-                    write(" ");
+        // Process physical gamepads (if enabled)
+        if (gamepadForwardingEnabled) {
+            for (const gamepad of navigator.getGamepads()) {
+                if (!gamepad) {
+                    continue;
                 }
-                for (const b of gamepad.axes) {
-                    write(b);
-                    write(" ");
+                write(gamepad.id);
+                write("\n");
+                if ((gamepad.mapping == 'standard') && !gamepad.id.includes('HID Receiver')) {
+                    for (const b of gamepad.buttons) {
+                        write(b.value);
+                        write(" ");
+                    }
+                    for (const b of gamepad.axes) {
+                        write(b);
+                        write(" ");
+                    }
+                    write("\n");
+                    b |= gamepad.buttons[0].pressed;
+                    a |= gamepad.buttons[1].pressed;
+                    y |= gamepad.buttons[2].pressed;
+                    x |= gamepad.buttons[3].pressed;
+                    l |= gamepad.buttons[4].pressed;
+                    r |= gamepad.buttons[5].pressed;
+                    zl |= gamepad.buttons[6].value > 0.25;
+                    zr |= gamepad.buttons[7].value > 0.25;
+                    minus |= gamepad.buttons[8].pressed;
+                    plus |= gamepad.buttons[9].pressed;
+                    ls |= gamepad.buttons[10].pressed;
+                    rs |= gamepad.buttons[11].pressed;
+                    home |= gamepad.buttons[16].pressed;
+                    dpad_up |= gamepad.buttons[12].pressed;
+                    dpad_down |= gamepad.buttons[13].pressed;
+                    dpad_left |= gamepad.buttons[14].pressed;
+                    dpad_right |= gamepad.buttons[15].pressed;
+                    lx = Math.max(0, Math.min(255, 128 + gamepad.axes[0] * 128));
+                    ly = Math.max(0, Math.min(255, 128 + gamepad.axes[1] * 128));
+                    rx = Math.max(0, Math.min(255, 128 + gamepad.axes[2] * 128));
+                    ry = Math.max(0, Math.min(255, 128 + gamepad.axes[3] * 128));
+                } else {
+                    write("IGNORED\n");
                 }
                 write("\n");
-                b |= gamepad.buttons[0].pressed;
-                a |= gamepad.buttons[1].pressed;
-                y |= gamepad.buttons[2].pressed;
-                x |= gamepad.buttons[3].pressed;
-                l |= gamepad.buttons[4].pressed;
-                r |= gamepad.buttons[5].pressed;
-                zl |= gamepad.buttons[6].value > 0.25;
-                zr |= gamepad.buttons[7].value > 0.25;
-                minus |= gamepad.buttons[8].pressed;
-                plus |= gamepad.buttons[9].pressed;
-                ls |= gamepad.buttons[10].pressed;
-                rs |= gamepad.buttons[11].pressed;
-                home |= gamepad.buttons[16].pressed;
-                dpad_up |= gamepad.buttons[12].pressed;
-                dpad_down |= gamepad.buttons[13].pressed;
-                dpad_left |= gamepad.buttons[14].pressed;
-                dpad_right |= gamepad.buttons[15].pressed;
-                lx = Math.max(0, Math.min(255, 128 + gamepad.axes[0] * 128));
-                ly = Math.max(0, Math.min(255, 128 + gamepad.axes[1] * 128));
-                rx = Math.max(0, Math.min(255, 128 + gamepad.axes[2] * 128));
-                ry = Math.max(0, Math.min(255, 128 + gamepad.axes[3] * 128));
-            } else {
-                write("IGNORED\n");
             }
-            write("\n");
         }
         
         // Include virtual button states
@@ -388,8 +398,8 @@ async function loop() {
         dpad_left |= virtualButtons.dpad_left;
         dpad_right |= virtualButtons.dpad_right;
         
-        // Include virtual analog stick values (only if no physical gamepad is moving them)
-        if (navigator.getGamepads().every(gamepad => !gamepad || gamepad.mapping !== 'standard' || gamepad.id.includes('HID Receiver'))) {
+        // Include virtual analog stick values (only if no physical gamepad is moving them or gamepad forwarding is disabled)
+        if (!gamepadForwardingEnabled || navigator.getGamepads().every(gamepad => !gamepad || gamepad.mapping !== 'standard' || gamepad.id.includes('HID Receiver'))) {
             lx = virtualSticks.lx;
             ly = virtualSticks.ly;
             rx = virtualSticks.rx;
