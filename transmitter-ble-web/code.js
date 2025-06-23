@@ -274,10 +274,10 @@ async function send_report(report) {
     }
 
     let data = new Uint8Array(4 + 8 + 4);
-    data[0] = 1;
-    data[1] = 2;
-    data[2] = 8;
-    data[3] = 0;
+    data[0] = 1;  // protocol version
+    data[1] = 2;  // descriptor number
+    data[2] = 8;  // length
+    data[3] = 1;  // report_id (now 1 to match virtual gamepad descriptor)
     data.set(report, 4);
     const crc = crc32(new DataView(data.buffer), 12);
     data[12] = (crc >> 0) & 0xFF;

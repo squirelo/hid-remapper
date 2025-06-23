@@ -566,6 +566,28 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
     }
 }
 
+// Virtual gamepad neutral state following horipad pattern
+static const uint8_t virtual_gamepad_neutral[] = { 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
+
+// Virtual gamepad helper functions following horipad pattern
+static void virtual_gamepad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
+    memcpy(report, virtual_gamepad_neutral, sizeof(virtual_gamepad_neutral));
+}
+
+static int32_t virtual_gamepad_default_value(uint32_t usage) {
+    switch (usage) {
+        case 0x00010039:  // Hat switch
+            return 15;    // Neutral hat switch position (matches horipad)
+        case 0x00010030:  // X axis
+        case 0x00010031:  // Y axis  
+        case 0x00010032:  // Z axis
+        case 0x00010035:  // Rz axis
+            return 0x80;  // Center position for analog sticks (matches horipad)
+        default:
+            return 0;
+    }
+}
+
 // Peripheral mode implementation functions
 static void peripheral_mode_init(void) {
     // Stop host mode scanning
@@ -582,53 +604,71 @@ static void peripheral_mode_init(void) {
     
     // Create a virtual transmitter device that represents the input source
     // This should match the descriptor of the device that's transmitting to us
-    uint16_t virtual_interface = 0xFF00;
+    uint16_t virtual_interface = 0xFF00;  // Will be changed to actual interface after parsing
     
     // For peripheral mode, we need to set up a virtual input device descriptor
     // that matches what the transmitter is sending. Use a standard gamepad descriptor
     // that should work with most common input formats.
     
-    // Nintendo Switch Pro Controller compatible descriptor for 8-byte reports
-    const uint8_t virtual_gamepad_descriptor[] = {
+    // Virtual gamepad descriptor with Report ID to match firmware format expectations
+    static const uint8_t virtual_gamepad_descriptor[] = {
         0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
         0x09, 0x05,        // Usage (Game Pad)
-        0xa1, 0x01,        // Collection (Application)
-        // Note: No Report ID specified = Report ID 0 (matches transmitter)
-        0x05, 0x09,        //   Usage Page (Button)
-        0x19, 0x01,        //   Usage Minimum (0x01)
-        0x29, 0x10,        //   Usage Maximum (0x10)
+        0xA1, 0x01,        // Collection (Application)
+        0x85, 0x01,        //   Report ID (1) - Add report ID to match firmware format
         0x15, 0x00,        //   Logical Minimum (0)
         0x25, 0x01,        //   Logical Maximum (1)
+        0x35, 0x00,        //   Physical Minimum (0)
+        0x45, 0x01,        //   Physical Maximum (1)
         0x75, 0x01,        //   Report Size (1)
-        0x95, 0x10,        //   Report Count (16) - 2 bytes of buttons
+        0x95, 0x0E,        //   Report Count (14) - 14 buttons like horipad
+        0x05, 0x09,        //   Usage Page (Button)
+        0x19, 0x01,        //   Usage Minimum (0x01)
+        0x29, 0x0E,        //   Usage Maximum (0x0E)
         0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x95, 0x02,        //   Report Count (2) - 2-bit padding like horipad
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
         0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
-        0x09, 0x39,        //   Usage (Hat switch) - D-pad
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x0F,        //   Logical Maximum (15)
-        0x75, 0x08,        //   Report Size (8)
+        0x25, 0x0F,        //   Logical Maximum (15) - to match transmitter dpad_lut
+        0x46, 0x3B, 0x01,  //   Physical Maximum (315)
+        0x75, 0x04,        //   Report Size (4)
         0x95, 0x01,        //   Report Count (1)
-        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x09, 0x30,        //   Usage (X) - Left stick X
-        0x09, 0x31,        //   Usage (Y) - Left stick Y
-        0x09, 0x32,        //   Usage (Z) - Right stick X
-        0x09, 0x35,        //   Usage (Rz) - Right stick Y
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x26, 0xff, 0x00,  //   Logical Maximum (255)
+        0x65, 0x14,        //   Unit (System: English Rotation, Length: Centimeter)
+        0x09, 0x39,        //   Usage (Hat switch)
+        0x81, 0x42,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,Null State)
+        0x65, 0x00,        //   Unit (None)
+        0x95, 0x01,        //   Report Count (1) - 4-bit padding
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+        0x46, 0xFF, 0x00,  //   Physical Maximum (255)
+        0x09, 0x30,        //   Usage (X)
+        0x09, 0x31,        //   Usage (Y)
+        0x09, 0x32,        //   Usage (Z)
+        0x09, 0x35,        //   Usage (Rz)
         0x75, 0x08,        //   Report Size (8)
-        0x95, 0x04,        //   Report Count (4) - 4 axes
+        0x95, 0x04,        //   Report Count (4)
         0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x75, 0x08,        //   Report Size (8) - like horipad
         0x95, 0x01,        //   Report Count (1) - 1 padding byte
         0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0xc0,              // End Collection
+        0xC0,              // End Collection
     };
     
-    // Parse the virtual transmitter descriptor
-    parse_descriptor(0xCAFE, 0xBABE, 
+    // Parse the virtual transmitter descriptor following horipad pattern
+    // Use interface 0 (like first real HID interface in host mode)
+    virtual_interface = 0x0000;  // Use proper interface 0x0000
+    
+    // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
+    // This prevents button offset issues where virtual device gets assigned index 8 
+    // and buttons appear as 9,10,11,12 instead of 1,2,3,4
+    interface_index_in_use = 0;
+    interface_index.clear();
+    
+    parse_descriptor(0x0F0D, 0x00C1,  // Use horipad VID/PID as reference
                     virtual_gamepad_descriptor, 
                     sizeof(virtual_gamepad_descriptor), 
                     virtual_interface, 0);
-    device_connected_callback(virtual_interface, 0xCAFE, 0xBABE, 0);
+    device_connected_callback(virtual_interface, 0x0F0D, 0x00C1, 0);
     
     // Force update of their descriptor derivates for the virtual device
     their_descriptor_updated = true;
@@ -699,13 +739,9 @@ static void handle_received_packet(const uint8_t* data, uint16_t len) {
         LOG_INF("Descriptor number changed to %d", our_descriptor_number);
     }
     
-    // Create HID report with report ID for the remapper system
-    uint8_t report[65];
-    report[0] = msg->report_id;
-    memcpy(report + 1, msg->data, len);
-    
-    // Inject into HID remapper system which will handle the actual sending
-    handle_received_report(report, len + 1, 0xFF00, msg->report_id);
+    // Pass the raw gamepad data with external report ID
+    // Don't prepend report_id since it's passed as external_report_id parameter
+    handle_received_report(msg->data, len, 0x0000, msg->report_id);
     
     LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
             msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
