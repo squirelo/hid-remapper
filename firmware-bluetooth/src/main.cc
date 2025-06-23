@@ -26,17 +26,16 @@
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
-#include "crc.h"  // If you have this from your receiver project
+#include "crc.h"
 
 LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
 #define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
 
-// Both modes active simultaneously
-static bool host_mode_enabled = true;   // Always start enabled
+static bool host_mode_enabled = true;
 static bool peripheral_mode_enabled = true;
 
-// Nordic UART Service UUID - using standard Nordic UUIDs for Web Bluetooth compatibility
+// Nordic UART Service UUID 
 static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
     0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
@@ -49,7 +48,6 @@ static struct bt_uuid_128 uart_tx_uuid = BT_UUID_INIT_128(
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
     0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
 
-// Add packet structure definitions similar to the receiver
 #define PROTOCOL_VERSION 1
 #define SERIAL_MAX_PACKET_SIZE 512
 
@@ -66,7 +64,6 @@ typedef struct __attribute__((packed)) {
     uint8_t data[0];
 } packet_t;
 
-// Add after the packet structure definitions
 typedef struct {
     uint8_t report_id;
     uint8_t len;
@@ -78,6 +75,15 @@ static outgoing_report_t outgoing_reports[OR_BUFSIZE];
 static uint8_t or_head = 0;
 static uint8_t or_tail = 0;
 static uint8_t or_items = 0;
+
+typedef struct {
+    uint8_t interface;
+    uint8_t len;
+    uint8_t data[65];  // Report with ID
+} usb_hid_msg_t;
+
+#define USB_HID_QUEUE_SIZE 16
+K_MSGQ_DEFINE(usb_hid_tx_q, sizeof(usb_hid_msg_t), USB_HID_QUEUE_SIZE, 4);
 
 static void queue_outgoing_report(uint8_t report_id, uint8_t* data, uint8_t len) {
     if (or_items == OR_BUFSIZE) {
@@ -91,7 +97,6 @@ static void queue_outgoing_report(uint8_t report_id, uint8_t* data, uint8_t len)
     or_items++;
 }
 
-// Packet buffer and state for SLIP-like framing
 static uint8_t packet_buffer[SERIAL_MAX_PACKET_SIZE];
 static uint16_t bytes_read = 0;
 static bool escaped = false;
@@ -165,10 +170,8 @@ K_MSGQ_DEFINE(disconnected_q, sizeof(struct disconnected_type), CONFIG_BT_MAX_CO
 K_MSGQ_DEFINE(set_report_q, sizeof(struct set_report_type), 8, 4);
 ATOMIC_DEFINE(tick_pending, 1);
 
-// Peripheral mode GATT service definitions
 static struct bt_conn *peripheral_conn;
 
-// Use Zephyr's simplified GATT service macro
 BT_GATT_SERVICE_DEFINE(uart_service,
     BT_GATT_PRIMARY_SERVICE(&uart_service_uuid),
     BT_GATT_CHARACTERISTIC(&uart_rx_uuid.uuid,
@@ -207,7 +210,7 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static bool scanning = false;
 static bool peers_only = true;
 
-static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(12, 24, 0, 3000);
+static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 0, 400);
 
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
@@ -227,6 +230,10 @@ static bool next_blink_state = true;
 
 static void led_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(led_work, led_work_fn);
+
+// USB HID transmit work function for non-blocking queue processing
+static void usb_hid_tx_work_fn(struct k_work* work);
+static K_WORK_DEFINE(usb_hid_tx_work, usb_hid_tx_work_fn);
 
 static void led_work_fn(struct k_work* work) {
     LedMode my_led_mode = (LedMode) atomic_get(&led_mode);
@@ -267,9 +274,46 @@ static void set_led_mode(LedMode led_mode_) {
     }
 }
 
+static void usb_hid_tx_work_fn(struct k_work* work) {
+    usb_hid_msg_t msg;
+    
+    while (k_msgq_get(&usb_hid_tx_q, &msg, K_NO_WAIT) == 0) {
+        if (msg.interface == 0) {
+            if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
+                if (CHK(hid_int_ep_write(hid_dev0, msg.data, msg.len, NULL))) {
+                    continue;
+                } else {
+                    k_sem_give(&usb_sem0);
+                    k_msgq_put(&usb_hid_tx_q, &msg, K_NO_WAIT);
+                    break;
+                }
+            } else {
+                // Can't get semaphore - requeue and try later
+                k_msgq_put(&usb_hid_tx_q, &msg, K_NO_WAIT);
+                break;
+            }
+        } else if (msg.interface == 1) {
+            if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
+                if (CHK(hid_int_ep_write(hid_dev1, msg.data, msg.len, NULL))) {
+                    // Success - semaphore will be released by callback
+                    continue;
+                } else {
+                    // Failed - give back semaphore and requeue
+                    k_sem_give(&usb_sem1);
+                    k_msgq_put(&usb_hid_tx_q, &msg, K_NO_WAIT);
+                    break;
+                }
+            } else {
+                // Can't get semaphore - requeue and try later
+                k_msgq_put(&usb_hid_tx_q, &msg, K_NO_WAIT);
+                break;
+            }
+        }
+    }
+}
 
 
-// Peripheral mode callbacks
+
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -282,7 +326,6 @@ static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 static void uart_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
     LOG_DBG("UART CCC changed: %d", value);
-    // Handle notification enable/disable
 }
 
 static void peripheral_connected(struct bt_conn *conn, uint8_t err)
@@ -297,8 +340,6 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
         LOG_INF("Peripheral connected");
         update_led_status();
         
-        // Don't aggressively update connection parameters - let them stabilize
-        // The original working version didn't force parameter updates
         LOG_INF("Peripheral connection established successfully");
     }
 }
@@ -311,7 +352,6 @@ static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
         peripheral_conn = NULL;
         update_led_status();
         
-        // Restart advertising
         start_peripheral_advertising();
     }
 }
@@ -356,28 +396,18 @@ static int count_connections() {
 }
 
 static void update_led_status() {
-    // LED status indication for dual mode:
-    // Solid ON: Both modes active with connections
-    // Fast blink: Host scanning or peripheral advertising
-    // Slow blink: Only one mode active
-    // OFF: No modes active (shouldn't happen normally)
-    
     bool host_active = host_mode_enabled && (scanning || count_connections() > 0);
     bool peripheral_active = peripheral_mode_enabled && (peripheral_conn != NULL);
     
     if (host_active && peripheral_active) {
-        // Both modes with connections - solid on
         set_led_mode(LedMode::ON);
     } else if (host_mode_enabled && peripheral_mode_enabled) {
-        // Both modes enabled but not all connected - fast blink
         atomic_set(&led_blink_count, 2);  // Fast blink pattern
         set_led_mode(LedMode::BLINK);
     } else if (host_active || peripheral_active) {
-        // Only one mode active - slow blink
         atomic_set(&led_blink_count, 1);  // Slow blink pattern
         set_led_mode(LedMode::BLINK);
     } else {
-        // No active connections - blink to show searching/advertising
         atomic_set(&led_blink_count, 3);  // Different pattern for searching
         set_led_mode(LedMode::BLINK);
     }
@@ -417,18 +447,8 @@ static bool scan_setup_filters() {
 }
 
 static void scan_start_work_fn(struct k_work* work) {
-    // Don't scan if host mode is disabled
     if (!host_mode_enabled) {
         LOG_DBG("Skipping scan - host mode disabled");
-        return;
-    }
-    
-    // CRITICAL: Stop scanning when peripheral has active connection to avoid interference
-    if (peripheral_mode_enabled && peripheral_conn) {
-        LOG_DBG("Stopping scan - peripheral mode has active connection to avoid interference");
-        if (scanning) {
-            scan_stop();
-        }
         return;
     }
     
@@ -576,20 +596,16 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
         button_pressed_at = k_uptime_get();
     } else {
         if (k_uptime_get() - button_pressed_at > CLEAR_BONDS_BUTTON_PRESS_MS) {
-            // Long press: clear bonds
             clear_bonds();
         } else {
-            // Short press: pair new device (host mode always enabled)
             LOG_INF("Pairing new device");
             pair_new_device();
         }
     }
 }
 
-// Virtual gamepad neutral state following horipad pattern
 static const uint8_t virtual_gamepad_neutral[] = { 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
 
-// Virtual gamepad helper functions following horipad pattern
 static void virtual_gamepad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
     memcpy(report, virtual_gamepad_neutral, sizeof(virtual_gamepad_neutral));
 }
@@ -608,10 +624,7 @@ static int32_t virtual_gamepad_default_value(uint32_t usage) {
     }
 }
 
-// Peripheral mode implementation functions
 static void peripheral_mode_init(void) {
-    // Only stop scanning and disconnect if host mode is completely disabled
-    // When both modes are enabled, let them coexist
     if (!host_mode_enabled) {
         if (scanning) {
             scan_stop();
@@ -619,18 +632,12 @@ static void peripheral_mode_init(void) {
         bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
     }
     
-    // Initialize packet reception state
     bytes_read = 0;
     escaped = false;
     
     // Create a virtual transmitter device that represents the input source
     uint16_t virtual_interface = 0x0000;  // Use proper interface 0x0000
     
-    // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
-    // This prevents button offset issues where virtual device gets assigned index 8 
-    // and buttons appear as 9,10,11,12 instead of 1,2,3,4
-    interface_index_in_use = 0;
-    interface_index.clear();
     
     // Virtual gamepad descriptor with Report ID to match firmware format expectations
     static const uint8_t virtual_gamepad_descriptor[] = {
@@ -682,10 +689,8 @@ static void peripheral_mode_init(void) {
                     virtual_interface, 0);
     device_connected_callback(virtual_interface, 0x0F0D, 0x00C1, 0);
     
-    // Force update of their descriptor derivates for the virtual device
     their_descriptor_updated = true;
     
-    // Start advertising if peripheral mode is enabled
     if (peripheral_mode_enabled) {
         start_peripheral_advertising();
     }
@@ -740,18 +745,14 @@ static void handle_received_packet(const uint8_t* data, uint16_t len) {
         return;
     }
     
-    // Handle descriptor change
     if (msg->our_descriptor_number != our_descriptor_number) {
         our_descriptor_number = msg->our_descriptor_number;
         
-        // Signal that configuration needs to be updated
         config_updated = true;
         
         LOG_INF("Descriptor number changed to %d", our_descriptor_number);
     }
     
-    // Pass the raw gamepad data with external report ID
-    // Don't prepend report_id since it's passed as external_report_id parameter
     handle_received_report(msg->data, len, 0x0000, msg->report_id);
     
     LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
@@ -780,7 +781,6 @@ static void process_byte_with_framing(uint8_t c) {
             case END:
                 if (bytes_read > 4) {
                     uint32_t crc = crc32(packet_buffer, bytes_read - 4);
-                    // Read CRC in little-endian format (matches transmitter)
                     uint32_t received_crc = 
                         (packet_buffer[bytes_read - 4] << 0) |
                         (packet_buffer[bytes_read - 3] << 8) |
@@ -806,7 +806,6 @@ static void process_byte_with_framing(uint8_t c) {
 }
 
 static void process_peripheral_command(uint8_t* buf, int count) {
-    // Process each byte with SLIP-like framing
     LOG_DBG("Received %d bytes from BLE", count);
     for (int i = 0; i < count; i++) {
         process_byte_with_framing(buf[i]);
@@ -824,7 +823,6 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
-        // Only restart scanning if host mode is enabled
         if (host_mode_enabled) {
             k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
         }
@@ -854,7 +852,6 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     count_connections();
 
-    // Only restart scanning if host mode is enabled
     if (host_mode_enabled) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
@@ -868,7 +865,6 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
         peers_only = true;
-        // Only start discovery if host mode is enabled
         if (host_mode_enabled) {
             gatt_discover(conn);
         }
@@ -884,10 +880,8 @@ static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t l
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
     LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", 
             param->interval_min, param->interval_max, param->latency, param->timeout);
-    
-    // Accept wider range of parameters for better compatibility
-    if (param->interval_min < 6) param->interval_min = 6;     // Minimum 7.5ms
-    if (param->interval_max > 800) param->interval_max = 800; // Maximum 1000ms
+    if (param->interval_min < 6) param->interval_min = 6;     // Minimum 7.5ms (esports-grade)
+    if (param->interval_max > 24) param->interval_max = 24;   // Cap at 30ms to prevent 1s+ intervals
     if (param->timeout < 100) param->timeout = 100;          // Minimum 1s timeout
     if (param->timeout > 3200) param->timeout = 3200;        // Maximum 32s timeout
     
@@ -932,7 +926,6 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         return BT_GATT_ITER_STOP;
     }
 
-    // Manage scanning based on host mode status
     if (scanning && host_mode_enabled) {
         scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
         k_work_submit(&scan_stop_work);
@@ -947,13 +940,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
 
     memcpy(buf.data + 1, data, buf.len);
     if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
-        //        printk("error in k_msg_put(report_q\n");
     }
 
     return BT_GATT_ITER_CONTINUE;
 }
 
-// XXX is this ready for simultaneous connection setup? is discovery ready? do we care?
 static struct descriptor_type their_descriptor;
 
 static void hogp_map_read_cb(struct bt_hogp* hogp, uint8_t err, const uint8_t* data, size_t size, size_t offset) {
@@ -1116,6 +1107,7 @@ static int get_report_cb(const struct device* dev, struct usb_setup_packet* setu
 
 static void int_in_ready_cb0(const struct device* dev) {
     k_sem_give(&usb_sem0);
+    k_work_submit(&usb_hid_tx_work);
 }
 
 static void int_out_ready_cb0(const struct device* dev) {
@@ -1130,6 +1122,7 @@ static void int_out_ready_cb0(const struct device* dev) {
 
 static void int_in_ready_cb1(const struct device* dev) {
     k_sem_give(&usb_sem1);
+    k_work_submit(&usb_hid_tx_work);
 }
 
 static const struct hid_ops ops0 = {
@@ -1150,22 +1143,19 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
         report_with_id++;
         len--;
     }
-    if (interface == 0) {
-        // Try to send immediately
-        if (CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL))) {
-            return true;
-        } else {
-            // Failed to send, queue it
-            if (len > 0) {
-                queue_outgoing_report(report_with_id[0], (uint8_t*)(report_with_id + 1), len - 1);
-            }
-            return false;
-        }
+     
+    // OPTIMIZATION 7: Queue USB writes to prevent blocking on flow control stalls
+    usb_hid_msg_t msg;
+    msg.interface = interface;
+    msg.len = len;
+    memcpy(msg.data, report_with_id, len);
+    
+    if (k_msgq_put(&usb_hid_tx_q, &msg, K_NO_WAIT) != 0) {
+        LOG_WRN("USB HID TX queue full - dropping report");
+        return false;
     }
-    if (interface == 1) {
-        return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
-    }
-    return false;  // Default case - interface not supported
+    
+    return true;  // Queued successfully - non-blocking
 }
 
 static void button_init() {
@@ -1472,33 +1462,25 @@ int main() {
             update_led_status();
             last_led_update = current_time;
         }
-        if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
-            if (!send_report(do_send_report)) {
-                k_sem_give(&usb_sem0);
-            }
-        }
-        if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
-            if (!send_monitor_report(do_send_report)) {
-                k_sem_give(&usb_sem1);
-            }
-        }
-
-        // Process queued outgoing reports when USB HID is ready
-        if ((or_items > 0) && (k_sem_take(&usb_sem0, K_NO_WAIT) == 0)) {
+        // OPTIMIZATION 9: Non-blocking USB HID report transmission using work queue
+        send_report(do_send_report);
+        send_monitor_report(do_send_report);
+        
+        // Process queued outgoing reports (legacy support)
+        if (or_items > 0) {
             uint8_t report_with_id[65];
             report_with_id[0] = outgoing_reports[or_head].report_id;
             memcpy(report_with_id + 1, outgoing_reports[or_head].data, outgoing_reports[or_head].len);
             
             if (do_send_report(0, report_with_id, outgoing_reports[or_head].len + 1)) {
-                // Successfully sent, remove from queue
-                // Semaphore will be released by USB callback
+                // Successfully queued, remove from legacy queue
                 or_head = (or_head + 1) % OR_BUFSIZE;
                 or_items--;
-            } else {
-                // Failed to send, give back semaphore
-                k_sem_give(&usb_sem0);
             }
         }
+        
+        // Trigger USB HID work processing
+        k_work_submit(&usb_hid_tx_work);
 
         if (!k_msgq_get(&set_report_q, &set_report_item, K_NO_WAIT)) {
             if (set_report_item.interface == 0) {
