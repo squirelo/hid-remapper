@@ -65,18 +65,6 @@ typedef struct __attribute__((packed)) {
 } packet_t;
 
 typedef struct {
-    uint8_t report_id;
-    uint8_t len;
-    uint8_t data[64];
-} outgoing_report_t;
-
-#define OR_BUFSIZE 8
-static outgoing_report_t outgoing_reports[OR_BUFSIZE];
-static uint8_t or_head = 0;
-static uint8_t or_tail = 0;
-static uint8_t or_items = 0;
-
-typedef struct {
     uint8_t interface;
     uint8_t len;
     uint8_t data[65];  // Report with ID
@@ -1405,17 +1393,6 @@ int main() {
         }
         send_report(do_send_report);
         send_monitor_report(do_send_report);
-        
-        if (or_items > 0) {
-            uint8_t report_with_id[65];
-            report_with_id[0] = outgoing_reports[or_head].report_id;
-            memcpy(report_with_id + 1, outgoing_reports[or_head].data, outgoing_reports[or_head].len);
-            
-            if (do_send_report(0, report_with_id, outgoing_reports[or_head].len + 1)) {
-                or_head = (or_head + 1) % OR_BUFSIZE;
-                or_items--;
-            }
-        }
         
         k_work_submit(&usb_hid_tx_work);
 
