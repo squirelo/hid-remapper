@@ -85,18 +85,6 @@ typedef struct {
 #define USB_HID_QUEUE_SIZE 16
 K_MSGQ_DEFINE(usb_hid_tx_q, sizeof(usb_hid_msg_t), USB_HID_QUEUE_SIZE, 4);
 
-static void queue_outgoing_report(uint8_t report_id, uint8_t* data, uint8_t len) {
-    if (or_items == OR_BUFSIZE) {
-        LOG_WRN("Report queue overflow!");
-        return;
-    }
-    outgoing_reports[or_tail].report_id = report_id;
-    outgoing_reports[or_tail].len = len;
-    memcpy(outgoing_reports[or_tail].data, data, len);
-    or_tail = (or_tail + 1) % OR_BUFSIZE;
-    or_items++;
-}
-
 static uint8_t packet_buffer[SERIAL_MAX_PACKET_SIZE];
 static uint16_t bytes_read = 0;
 static bool escaped = false;
@@ -106,7 +94,6 @@ static void process_peripheral_command(uint8_t* buf, int count);
 static void start_peripheral_advertising(void);
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
 static void update_led_status(void);
-static void enable_dual_mode(void);
 
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
@@ -601,26 +588,6 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
             LOG_INF("Pairing new device");
             pair_new_device();
         }
-    }
-}
-
-static const uint8_t virtual_gamepad_neutral[] = { 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
-
-static void virtual_gamepad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
-    memcpy(report, virtual_gamepad_neutral, sizeof(virtual_gamepad_neutral));
-}
-
-static int32_t virtual_gamepad_default_value(uint32_t usage) {
-    switch (usage) {
-        case 0x00010039:  // Hat switch
-            return 15;    // Neutral hat switch position (matches horipad)
-        case 0x00010030:  // X axis
-        case 0x00010031:  // Y axis  
-        case 0x00010032:  // Z axis
-        case 0x00010035:  // Rz axis
-            return 0x80;  // Center position for analog sticks (matches horipad)
-        default:
-            return 0;
     }
 }
 
@@ -1329,16 +1296,6 @@ void disable_peripheral_mode() {
             CHK(bt_conn_disconnect(peripheral_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
         }
     }
-}
-
-void enable_dual_mode() {
-    if (!peripheral_mode_enabled) {
-        enable_peripheral_mode();
-    }
-    if (!host_mode_enabled) {
-        enable_host_mode();
-    }
-    LOG_INF("Dual mode enabled - both host and peripheral active");
 }
 
 void my_mutexes_init() {
