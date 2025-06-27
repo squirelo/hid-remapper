@@ -1,6 +1,3 @@
-#include <errno.h>
-#include <stddef.h>
-
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
 #include <bluetooth/services/hogp.h>
@@ -14,7 +11,6 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/printk.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/types.h>
 #include <zephyr/usb/class/usb_hid.h>
@@ -89,8 +85,16 @@ static void uart_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value
 static void peripheral_connected(struct bt_conn *conn, uint8_t err);
 static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason);
 
+// Timing constants
 static const int SCAN_DELAY_MS = 1000;
 static const int CLEAR_BONDS_BUTTON_PRESS_MS = 3000;
+static const int LED_BLINK_ON_MS = 100;           // LED on duration during blink
+static const int LED_BLINK_OFF_MS = 100;          // LED off duration during blink  
+static const int LED_BLINK_CYCLE_MS = 1000;       // Time between blink cycles
+static const int ACTIVITY_LED_DURATION_MS = 50;   // Activity LED on duration
+static const int RESTART_ADVERTISING_DELAY_MS = 100;  // Delay before restarting advertising
+static const int LED_STATUS_UPDATE_INTERVAL_MS = 5000;  // LED status check interval
+static const int MAIN_LOOP_SLEEP_US = 1;          // Main loop sleep to prevent pairing issues
 
 // these macros don't work in C++ when used directly ("taking address of temporary array")
 static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HIDS_VAL);
@@ -200,8 +204,8 @@ enum class LedMode {
 
 static atomic_t led_blink_count = ATOMIC_INIT(0);
 static atomic_t led_mode = (atomic_t) ATOMIC_INIT(LedMode::OFF);
-static int led_blinks_left = 0;
-static bool next_blink_state = true;
+static atomic_t led_blinks_left = ATOMIC_INIT(0);
+static atomic_t next_blink_state = ATOMIC_INIT(true);
 
 static void led_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(led_work, led_work_fn);
@@ -221,21 +225,21 @@ static void led_work_fn(struct k_work* work) {
             break;
         case LedMode::BLINK: {
             int next_work = 0;
-            if (next_blink_state) {
-                if (led_blinks_left > 0) {
-                    led_blinks_left--;
+            if (atomic_get(&next_blink_state)) {
+                if (atomic_get(&led_blinks_left) > 0) {
+                    atomic_dec(&led_blinks_left);
                     gpio_pin_set_dt(&led1, true);
-                    next_blink_state = false;
-                    next_work = 100;
+                    atomic_set(&next_blink_state, false);
+                    next_work = LED_BLINK_ON_MS;
                 } else {
-                    led_blinks_left = atomic_get(&led_blink_count);
+                    atomic_set(&led_blinks_left, atomic_get(&led_blink_count));
                     gpio_pin_set_dt(&led1, false);
-                    next_work = 1000;
+                    next_work = LED_BLINK_CYCLE_MS;
                 }
             } else {
                 gpio_pin_set_dt(&led1, false);
-                next_blink_state = true;
-                next_work = 100;
+                atomic_set(&next_blink_state, true);
+                next_work = LED_BLINK_OFF_MS;
             }
             k_work_reschedule(&led_work, K_MSEC(next_work));
             break;
@@ -245,6 +249,8 @@ static void led_work_fn(struct k_work* work) {
 
 static void set_led_mode(LedMode led_mode_) {
     if (atomic_set(&led_mode, (atomic_val_t) led_mode_) != (atomic_val_t) led_mode_) {
+        // Cancel any pending LED work before rescheduling to prevent race conditions
+        k_work_cancel_delayable(&led_work);
         k_work_reschedule(&led_work, K_NO_WAIT);
     }
 }
@@ -343,7 +349,7 @@ static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
         update_led_status();
         
         // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(100));
+        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
     }
 }
 
@@ -851,7 +857,7 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
         escaped = false;
         
         // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(100));
+        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
         update_led_status();
         return; // Don't process as host connection
     }
@@ -951,8 +957,10 @@ static int8_t hogp_index(struct bt_hogp* hogp) {
 }
 
 static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
-    k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // XXX what if work_fn is currently running? it might turn the led off after we turn it on
+    // Cancel any pending activity LED work to prevent race conditions
+    k_work_cancel_delayable(&activity_led_off_work);
     gpio_pin_set_dt(&led0, true);
+    k_work_reschedule(&activity_led_off_work, K_MSEC(ACTIVITY_LED_DURATION_MS));
 
     if (!data) {
         return BT_GATT_ITER_STOP;
@@ -1469,7 +1477,7 @@ int main() {
         }
         
         int64_t current_time = k_uptime_get();
-        if (current_time - last_led_update > 5000) {
+        if (current_time - last_led_update > LED_STATUS_UPDATE_INTERVAL_MS) {
             update_led_status();
             last_led_update = current_time;
         }
@@ -1531,7 +1539,7 @@ int main() {
         }
 
         // without this sleep, some devices won't pair; some thread priority issue?
-        k_sleep(K_USEC(1));  // XXX
+        k_sleep(K_USEC(MAIN_LOOP_SLEEP_US));  // XXX
     }
 
     return 0;
