@@ -19,7 +19,9 @@
 #include <zephyr/types.h>
 #include <zephyr/usb/class/usb_hid.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/drivers/sensor.h>
 
+#include "accel_descriptor.h"
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
@@ -52,6 +54,18 @@ static bool get_report_response_ready = false;
 
 static const struct device* hid_dev0;
 static const struct device* hid_dev1;  // config interface
+
+// Forward declarations
+static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
+
+// Accelerometer support
+static const struct device* accel_dev;
+static void accel_work_fn(struct k_work* work);
+static K_WORK_DELAYABLE_DEFINE(accel_work, accel_work_fn);
+
+#define REPORT_ID_ACCEL 0x10
+#define ACCEL_SAMPLE_RATE_MS 50
+#define ACCEL_VIRTUAL_INTERFACE 0x0000  // Virtual interface ID for accelerometer
 
 struct report_type {
     uint16_t interface;
@@ -118,6 +132,57 @@ static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
 }
 static K_WORK_DELAYABLE_DEFINE(activity_led_off_work, activity_led_off_work_fn);
+
+/* Called every 50 ms (20 Hz) to read accel and queue/process it */
+static void accel_work_fn(struct k_work* work) {
+    struct sensor_value accel[3];
+
+    if (!accel_dev) {
+        return;
+    }
+
+    /* Trigger a new sample */
+    if (sensor_sample_fetch(accel_dev) < 0) {
+        LOG_WRN("Accel fetch fail");
+        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+    } else if (sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, accel) < 0) {
+        LOG_WRN("Accel channel fail");
+        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+    } else {
+        /* accel[0], accel[1], accel[2] now hold X, Y, Z in m/s² */
+        /* Convert to mg units (milliG) */
+        int16_t x = (int16_t)(sensor_value_to_double(&accel[0]) * 1000.0);
+        int16_t y = (int16_t)(sensor_value_to_double(&accel[1]) * 1000.0);
+        int16_t z = (int16_t)(sensor_value_to_double(&accel[2]) * 1000.0);
+        
+        // Convert accelerometer data to gamepad format (like working fork)
+        uint8_t report[9] = { 
+            // 14 buttons (2 bytes) + 2-bit padding - all released
+            0x00, 0x00,
+            // Hat switch (4-bit) + 4-bit padding - neutral (8 = center)  
+            0x08,
+            // X axis (8-bit) - map accelerometer X to 0-255
+            (uint8_t)((x + 32768) >> 8),
+            // Y axis (8-bit) - map accelerometer Y to 0-255
+            (uint8_t)((y + 32768) >> 8),
+            // Z axis (8-bit) - map accelerometer Z to 0-255
+            (uint8_t)((z + 32768) >> 8),
+            // Rz axis (8-bit) - neutral value
+            0x80,
+            // 1 padding byte
+            0x00
+        };
+        
+        /* Send the accelerometer report through the standard remapping system */
+        handle_received_report(report, sizeof(report), ACCEL_VIRTUAL_INTERFACE);
+  
+        /* Turn on LED to indicate accelerometer data is working */
+        gpio_pin_set_dt(&led0, true);
+    }
+
+    /* Reschedule */
+    k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
+}
 
 enum class LedMode {
     OFF = 0,
@@ -718,6 +783,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;  // Invalid interface
 }
 
 static void button_init() {
@@ -905,6 +971,26 @@ int main() {
     my_mutexes_init();
     button_init();
     leds_init();
+    
+    // Initialize accelerometer
+    accel_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
+    if (!device_is_ready(accel_dev)) {
+        LOG_ERR("Could not get accelerometer device");
+        accel_dev = NULL;
+    } else {
+        LOG_INF("Accelerometer device found and ready");
+        
+        // Register accelerometer as a virtual device (using proven approach from working fork)
+        parse_descriptor(0x0F0D, 0x00C1, accel_hid_report_desc, ACCEL_HID_REPORT_DESC_SIZE, ACCEL_VIRTUAL_INTERFACE, 0);
+        device_connected_callback(ACCEL_VIRTUAL_INTERFACE, 0x0F0D, 0x00C1, 0);
+        
+        // Force descriptor update like the working fork
+        their_descriptor_updated = true;
+        
+        // Start accelerometer sampling after a short delay
+        k_work_schedule(&accel_work, K_MSEC(1000));
+    }
+    
     bt_init();
     CHK(settings_subsys_init());
     CHK(settings_register(&our_settings_handlers));

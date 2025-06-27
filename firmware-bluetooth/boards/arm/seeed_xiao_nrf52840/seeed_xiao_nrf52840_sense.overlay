@@ -1,0 +1,39 @@
+/ {
+	aliases {
+		accel0 = &lsm6ds3;
+	};
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twi";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	lsm6ds3: lsm6ds3@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		status = "okay";
+		irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+			low-power-enable;
+		};
+	};
+}; 
