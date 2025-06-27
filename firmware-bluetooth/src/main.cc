@@ -63,7 +63,6 @@ static const struct device* accel_dev;
 static void accel_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(accel_work, accel_work_fn);
 
-#define REPORT_ID_ACCEL 0x10
 #define ACCEL_SAMPLE_RATE_MS 50
 #define ACCEL_VIRTUAL_INTERFACE 0x0000  // Virtual interface ID for accelerometer
 
@@ -138,6 +137,7 @@ static void accel_work_fn(struct k_work* work) {
     struct sensor_value accel[3];
 
     if (!accel_dev) {
+        k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
         return;
     }
 
@@ -145,40 +145,48 @@ static void accel_work_fn(struct k_work* work) {
     if (sensor_sample_fetch(accel_dev) < 0) {
         LOG_WRN("Accel fetch fail");
         gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
-    } else if (sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, accel) < 0) {
+        k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
+        return;
+    }
+    
+    if (sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, accel) < 0) {
         LOG_WRN("Accel channel fail");
         gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
-    } else {
-        /* accel[0], accel[1], accel[2] now hold X, Y, Z in m/s² */
-        /* Convert to mg units (milliG) */
-        int16_t x = (int16_t)(sensor_value_to_double(&accel[0]) * 1000.0);
-        int16_t y = (int16_t)(sensor_value_to_double(&accel[1]) * 1000.0);
-        int16_t z = (int16_t)(sensor_value_to_double(&accel[2]) * 1000.0);
-        
-        // Convert accelerometer data to gamepad format (like working fork)
-        uint8_t report[9] = { 
-            // 14 buttons (2 bytes) + 2-bit padding - all released
-            0x00, 0x00,
-            // Hat switch (4-bit) + 4-bit padding - neutral (8 = center)  
-            0x08,
-            // X axis (8-bit) - map accelerometer X to 0-255
-            (uint8_t)((x + 32768) >> 8),
-            // Y axis (8-bit) - map accelerometer Y to 0-255
-            (uint8_t)((y + 32768) >> 8),
-            // Z axis (8-bit) - map accelerometer Z to 0-255
-            (uint8_t)((z + 32768) >> 8),
-            // Rz axis (8-bit) - neutral value
-            0x80,
-            // 1 padding byte
-            0x00
-        };
-        
-        /* Send the accelerometer report through the standard remapping system */
-        handle_received_report(report, sizeof(report), ACCEL_VIRTUAL_INTERFACE);
-  
-        /* Turn on LED to indicate accelerometer data is working */
-        gpio_pin_set_dt(&led0, true);
+        k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
+        return;
     }
+    
+    /* accel[0], accel[1], accel[2] now hold X, Y, Z in m/s² */
+    /* Convert to mg units (milliG) */
+    int16_t x = (int16_t)(sensor_value_to_double(&accel[0]) * 1000.0);
+    int16_t y = (int16_t)(sensor_value_to_double(&accel[1]) * 1000.0);
+    int16_t z = (int16_t)(sensor_value_to_double(&accel[2]) * 1000.0);
+    
+    // Convert accelerometer data to horipad gamepad format (no report ID)
+    uint8_t report[8] = { 
+        // 14 buttons (2 bytes) + 2-bit padding - all released
+        0x00, 0x00,
+        // Hat switch (4-bit) + 4-bit padding - neutral (15 = center for horipad format)  
+        0x0F,
+        // X axis (8-bit) - map accelerometer X to 0-255
+        (uint8_t)((x + 32768) >> 8),
+        // Y axis (8-bit) - map accelerometer Y to 0-255
+        (uint8_t)((y + 32768) >> 8),
+        // Z axis (8-bit) - map accelerometer Z to 0-255
+        (uint8_t)((z + 32768) >> 8),
+        // Rz axis (8-bit) - neutral value
+        0x80,
+        // 1 padding byte (required by descriptor)
+        0x00
+    };
+    
+    /* Send the accelerometer report through the standard remapping system */
+    handle_received_report(report, sizeof(report), ACCEL_VIRTUAL_INTERFACE);
+
+    /* Blink LED to indicate accelerometer data is working (same pattern as Bluetooth activity) */
+    k_work_cancel_delayable(&activity_led_off_work);  // Cancel any pending LED off work
+    gpio_pin_set_dt(&led0, true);                     // Turn LED on immediately
+    k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // Schedule LED off after 50ms
 
     /* Reschedule */
     k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
@@ -972,25 +980,6 @@ int main() {
     button_init();
     leds_init();
     
-    // Initialize accelerometer
-    accel_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
-    if (!device_is_ready(accel_dev)) {
-        LOG_ERR("Could not get accelerometer device");
-        accel_dev = NULL;
-    } else {
-        LOG_INF("Accelerometer device found and ready");
-        
-        // Register accelerometer as a virtual device (using proven approach from working fork)
-        parse_descriptor(0x0F0D, 0x00C1, accel_hid_report_desc, ACCEL_HID_REPORT_DESC_SIZE, ACCEL_VIRTUAL_INTERFACE, 0);
-        device_connected_callback(ACCEL_VIRTUAL_INTERFACE, 0x0F0D, 0x00C1, 0);
-        
-        // Force descriptor update like the working fork
-        their_descriptor_updated = true;
-        
-        // Start accelerometer sampling after a short delay
-        k_work_schedule(&accel_work, K_MSEC(1000));
-    }
-    
     bt_init();
     CHK(settings_subsys_init());
     CHK(settings_register(&our_settings_handlers));
@@ -1000,6 +989,25 @@ int main() {
     scan_init();
     parse_our_descriptor();
     set_mapping_from_config();
+    
+    // Initialize accelerometer AFTER mapping system is ready
+    accel_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
+    if (!device_is_ready(accel_dev)) {
+        LOG_ERR("Could not get accelerometer device");
+        accel_dev = NULL;
+    } else {
+        LOG_INF("Accelerometer device found and ready");
+        
+        // Create virtual device for accelerometer (like the working version)
+        parse_descriptor(0x0F0D, 0x00C1, accel_hid_report_desc, ACCEL_HID_REPORT_DESC_SIZE, ACCEL_VIRTUAL_INTERFACE, 0);
+        device_connected_callback(ACCEL_VIRTUAL_INTERFACE, 0x0F0D, 0x00C1, 0);
+        
+        // Force descriptor update
+        their_descriptor_updated = true;
+        
+        // Start accelerometer sampling after a short delay
+        k_work_schedule(&accel_work, K_MSEC(1000));
+    }
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 
