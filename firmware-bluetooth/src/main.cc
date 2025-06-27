@@ -319,15 +319,31 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
     }
 }
 
+static void restart_advertising_work_fn(struct k_work* work);
+static K_WORK_DELAYABLE_DEFINE(restart_advertising_work, restart_advertising_work_fn);
+
+static void restart_advertising_work_fn(struct k_work* work) {
+    if (peripheral_mode_enabled && peripheral_conn == NULL) {
+        LOG_INF("Restarting peripheral advertising after disconnect");
+        start_peripheral_advertising();
+    }
+}
+
 static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     if (peripheral_mode_enabled && conn == peripheral_conn) {
         LOG_INF("Peripheral disconnected (reason %u)", reason);
         bt_conn_unref(peripheral_conn);
         peripheral_conn = NULL;
+        
+        // Reset packet parsing state on disconnect
+        bytes_read = 0;
+        escaped = false;
+        
         update_led_status();
         
-        start_peripheral_advertising();
+        // Delay before restarting advertising to ensure connection cleanup
+        k_work_reschedule(&restart_advertising_work, K_MSEC(100));
     }
 }
 
@@ -654,6 +670,15 @@ static void peripheral_mode_init(void) {
 }
 
 static void start_peripheral_advertising(void) {
+    if (!peripheral_mode_enabled) {
+        LOG_DBG("Peripheral mode disabled, skipping advertising");
+        return;
+    }
+    
+    // Stop any existing advertising first
+    int stop_result = bt_le_adv_stop();
+    LOG_DBG("Advertising stop result: %d (0=success, -EALREADY=not running)", stop_result);
+    
     struct bt_le_adv_param adv_param = {
         .id = BT_ID_DEFAULT,
         .sid = 0,
@@ -672,8 +697,15 @@ static void start_peripheral_advertising(void) {
                       0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e),
     };
 
-    CHK(bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0));
-    LOG_INF("Peripheral advertising started as 'HID Remapper'");
+    int result = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (result == 0) {
+        LOG_INF("Peripheral advertising started as 'HID Remapper'");
+    } else {
+        LOG_ERR("Failed to start peripheral advertising, error: %d", result);
+        if (result == -EALREADY) {
+            LOG_WRN("Advertising already running");
+        }
+    }
 }
 
 static void handle_received_packet(const uint8_t* data, uint16_t len) {
@@ -770,10 +802,6 @@ static void process_peripheral_command(uint8_t* buf, int count) {
 static void connected(struct bt_conn* conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
 
-    scanning = false;
-    count_connections();
-    set_led_mode(LedMode::BLINK);
-
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     if (conn_err) {
@@ -784,9 +812,25 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
         return;
     }
 
-    LOG_INF("%s", addr);
+    // Check if this is an incoming connection (peripheral mode)
+    struct bt_conn_info info;
+    bt_conn_get_info(conn, &info);
+    
+    if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+        LOG_INF("Incoming peripheral connection: %s", addr);
+        // Don't force security for incoming connections - let client decide
+        return;
+    }
 
-    CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
+    LOG_INF("Outgoing host connection: %s", addr);
+
+    // This is a host mode connection (outgoing)
+    if (host_mode_enabled) {
+        scanning = false;
+        count_connections();
+        set_led_mode(LedMode::BLINK);
+        CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
+    }
 }
 
 static void disconnected(struct bt_conn* conn, uint8_t reason) {
@@ -794,8 +838,25 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    LOG_INF("%s (reason=%u)", addr, reason);
+    LOG_INF("Disconnected: %s (reason=%u)", addr, reason);
 
+    // Handle peripheral mode disconnection (in case peripheral_disconnected wasn't called)
+    if (peripheral_mode_enabled && conn == peripheral_conn) {
+        LOG_INF("Peripheral connection cleanup in generic disconnect handler");
+        bt_conn_unref(peripheral_conn);
+        peripheral_conn = NULL;
+        
+        // Reset packet parsing state on disconnect
+        bytes_read = 0;
+        escaped = false;
+        
+        // Delay before restarting advertising to ensure connection cleanup
+        k_work_reschedule(&restart_advertising_work, K_MSEC(100));
+        update_led_status();
+        return; // Don't process as host connection
+    }
+
+    // Handle host mode disconnections
     uint8_t conn_idx = bt_conn_index(conn);
 
     if (bt_hogp_assign_check(&hogps[conn_idx])) {
@@ -810,6 +871,8 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     if (host_mode_enabled) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
+    
+    update_led_status();
 }
 
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
@@ -818,13 +881,19 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     if (!err) {
-        LOG_INF("%s, level=%u.", addr, level);
-        peers_only = true;
-        if (host_mode_enabled) {
+        LOG_INF("Security level changed: %s, level=%u", addr, level);
+        
+        // Only do GATT discovery for host mode connections
+        if (host_mode_enabled && conn != peripheral_conn) {
+            peers_only = true;
             gatt_discover(conn);
         }
     } else {
-        LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
+        LOG_WRN("Security change failed: %s, level=%u, err=%d", addr, level, err);
+        // Don't force disconnect on security failure for peripheral connections
+        if (conn != peripheral_conn) {
+            LOG_ERR("Security failure on host connection, may disconnect");
+        }
     }
 }
 
@@ -834,7 +903,20 @@ static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t l
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
     LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", param->interval_min, param->interval_max, param->latency, param->timeout);
-    param->interval_max = param->interval_min;
+    
+    // Be more permissive with connection parameters for web clients
+    // Allow the requested parameters within reasonable bounds
+    if (param->interval_min >= 6 && param->interval_max <= 3200 && 
+        param->latency <= 30 && param->timeout >= 10 && param->timeout <= 3200) {
+        return true;  // Accept the client's requested parameters
+    }
+    
+    // If parameters are out of bounds, suggest reasonable defaults
+    param->interval_min = 6;   // 7.5ms
+    param->interval_max = 12;  // 15ms  
+    param->latency = 0;
+    param->timeout = 400;      // 4s
+    
     return true;
 }
 
