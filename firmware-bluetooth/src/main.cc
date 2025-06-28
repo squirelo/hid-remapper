@@ -66,6 +66,14 @@ static K_WORK_DELAYABLE_DEFINE(accel_work, accel_work_fn);
 #define ACCEL_SAMPLE_RATE_MS 50
 #define ACCEL_VIRTUAL_INTERFACE 0x0000  // Virtual interface ID for accelerometer
 
+// Add accelerometer trigger support
+#ifdef CONFIG_LSM6DSL_TRIGGER
+static void accel_trigger_handler(const struct device *dev, const struct sensor_trigger *trig) {
+    /* Schedule work to handle sensor reading in main thread context */
+    k_work_submit((struct k_work*)&accel_work);
+}
+#endif
+
 struct report_type {
     uint16_t interface;
     uint8_t len;
@@ -149,18 +157,48 @@ static void accel_work_fn(struct k_work* work) {
         return;
     }
     
-    if (sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_XYZ, accel) < 0) {
+    /* Get individual channel values */
+    if (sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_X, &accel[0]) < 0 ||
+        sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_Y, &accel[1]) < 0 ||
+        sensor_channel_get(accel_dev, SENSOR_CHAN_ACCEL_Z, &accel[2]) < 0) {
         LOG_WRN("Accel channel fail");
         gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
         k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
         return;
     }
     
-    /* accel[0], accel[1], accel[2] now hold X, Y, Z in m/s² */
-    /* Convert to mg units (milliG) */
-    int16_t x = (int16_t)(sensor_value_to_double(&accel[0]) * 1000.0);
-    int16_t y = (int16_t)(sensor_value_to_double(&accel[1]) * 1000.0);
-    int16_t z = (int16_t)(sensor_value_to_double(&accel[2]) * 1000.0);
+    /* Convert to double and then to appropriate gamepad range */
+    double x_ms2 = sensor_value_to_double(&accel[0]);
+    double y_ms2 = sensor_value_to_double(&accel[1]);
+    double z_ms2 = sensor_value_to_double(&accel[2]);
+    
+    /* Log raw values occasionally for debugging */
+    static int debug_counter = 0;
+    if (++debug_counter >= 40) {  // Log every 2 seconds (40 * 50ms)
+        LOG_DBG("Accel raw: X=%.3f Y=%.3f Z=%.3f m/s²", x_ms2, y_ms2, z_ms2);
+        debug_counter = 0;
+    }
+    
+    /* Convert from m/s² to g units (1g ≈ 9.81 m/s²) */
+    double x_g = x_ms2 / 9.81;
+    double y_g = y_ms2 / 9.81;
+    double z_g = z_ms2 / 9.81;
+    
+    /* Scale to 8-bit range (0-255) with 128 as center (0g) */
+    /* Assuming typical ±2g range, scale accordingly */
+    uint8_t x_scaled = (uint8_t)(128 + (x_g * 64));  // ±2g maps to 0-255
+    uint8_t y_scaled = (uint8_t)(128 + (y_g * 64));
+    uint8_t z_scaled = (uint8_t)(128 + (z_g * 64));
+    
+    /* Clamp values to valid range */
+    x_scaled = (x_scaled > 255) ? 255 : x_scaled;
+    y_scaled = (y_scaled > 255) ? 255 : y_scaled;
+    z_scaled = (z_scaled > 255) ? 255 : z_scaled;
+    
+    /* Log scaled values occasionally for debugging */
+    if (debug_counter == 20) {  // Log in the middle of the cycle
+        LOG_DBG("Accel scaled: X=%d Y=%d Z=%d", x_scaled, y_scaled, z_scaled);
+    }
     
     // Convert accelerometer data to horipad gamepad format (no report ID)
     uint8_t report[8] = { 
@@ -168,12 +206,12 @@ static void accel_work_fn(struct k_work* work) {
         0x00, 0x00,
         // Hat switch (4-bit) + 4-bit padding - neutral (15 = center for horipad format)  
         0x0F,
-        // X axis (8-bit) - map accelerometer X to 0-255
-        (uint8_t)((x + 32768) >> 8),
-        // Y axis (8-bit) - map accelerometer Y to 0-255
-        (uint8_t)((y + 32768) >> 8),
-        // Z axis (8-bit) - map accelerometer Z to 0-255
-        (uint8_t)((z + 32768) >> 8),
+        // X axis (8-bit) - accelerometer X
+        x_scaled,
+        // Y axis (8-bit) - accelerometer Y
+        y_scaled,
+        // Z axis (8-bit) - accelerometer Z (mapped to gamepad Z)
+        z_scaled,
         // Rz axis (8-bit) - neutral value
         0x80,
         // 1 padding byte (required by descriptor)
@@ -188,8 +226,76 @@ static void accel_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, true);                     // Turn LED on immediately
     k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // Schedule LED off after 50ms
 
-    /* Reschedule */
+#ifndef CONFIG_LSM6DSL_TRIGGER
+    /* Only reschedule if not using triggers */
     k_work_reschedule(&accel_work, K_MSEC(ACCEL_SAMPLE_RATE_MS));
+#endif
+}
+
+static bool accel_init() {
+    accel_dev = DEVICE_DT_GET(DT_NODELABEL(lsm6ds3tr_c));
+    
+    if (!device_is_ready(accel_dev)) {
+        LOG_ERR("Accelerometer device not ready");
+        return false;
+    }
+
+    LOG_INF("Accelerometer device found and ready");
+
+    /* Set sampling frequency to 104 Hz (similar to working example) */
+    struct sensor_value odr_attr;
+    odr_attr.val1 = 104;
+    odr_attr.val2 = 0;
+
+    if (sensor_attr_set(accel_dev, SENSOR_CHAN_ACCEL_XYZ,
+                        SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr) < 0) {
+        LOG_ERR("Cannot set sampling frequency for accelerometer");
+        return false;
+    }
+
+    /* Set accelerometer full scale to ±2g */
+    struct sensor_value scale_attr;
+    scale_attr.val1 = 2;  /* ±2g */
+    scale_attr.val2 = 0;
+
+    if (sensor_attr_set(accel_dev, SENSOR_CHAN_ACCEL_XYZ,
+                        SENSOR_ATTR_FULL_SCALE, &scale_attr) < 0) {
+        LOG_WRN("Cannot set full scale for accelerometer (continuing anyway)");
+    }
+
+    /* Take an initial sample to verify sensor is working */
+    if (sensor_sample_fetch(accel_dev) < 0) {
+        LOG_ERR("Initial sensor sample fetch failed");
+        return false;
+    }
+
+    /* Create virtual device for accelerometer (like the working version) */
+    parse_descriptor(0x0F0D, 0x00C1, accel_hid_report_desc, ACCEL_HID_REPORT_DESC_SIZE, ACCEL_VIRTUAL_INTERFACE, 0);
+    device_connected_callback(ACCEL_VIRTUAL_INTERFACE, 0x0F0D, 0x00C1, 0);
+    
+    /* Force descriptor update */
+    their_descriptor_updated = true;
+
+#ifdef CONFIG_LSM6DSL_TRIGGER
+    /* Set up data ready trigger */
+    struct sensor_trigger trig;
+    trig.type = SENSOR_TRIG_DATA_READY;
+    trig.chan = SENSOR_CHAN_ACCEL_XYZ;
+
+    if (sensor_trigger_set(accel_dev, &trig, accel_trigger_handler) < 0) {
+        LOG_WRN("Could not set sensor trigger, falling back to polling");
+        /* Fall back to polling mode */
+        k_work_schedule(&accel_work, K_MSEC(1000));
+    } else {
+        LOG_INF("Accelerometer trigger mode enabled");
+    }
+#else
+    /* Use polling mode */
+    LOG_INF("Accelerometer polling mode enabled");
+    k_work_schedule(&accel_work, K_MSEC(1000));
+#endif
+
+    return true;
 }
 
 enum class LedMode {
@@ -991,22 +1097,9 @@ int main() {
     set_mapping_from_config();
     
     // Initialize accelerometer AFTER mapping system is ready
-    accel_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
-    if (!device_is_ready(accel_dev)) {
-        LOG_ERR("Could not get accelerometer device");
+    if (!accel_init()) {
+        LOG_ERR("Failed to initialize accelerometer");
         accel_dev = NULL;
-    } else {
-        LOG_INF("Accelerometer device found and ready");
-        
-        // Create virtual device for accelerometer (like the working version)
-        parse_descriptor(0x0F0D, 0x00C1, accel_hid_report_desc, ACCEL_HID_REPORT_DESC_SIZE, ACCEL_VIRTUAL_INTERFACE, 0);
-        device_connected_callback(ACCEL_VIRTUAL_INTERFACE, 0x0F0D, 0x00C1, 0);
-        
-        // Force descriptor update
-        their_descriptor_updated = true;
-        
-        // Start accelerometer sampling after a short delay
-        k_work_schedule(&accel_work, K_MSEC(1000));
     }
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
