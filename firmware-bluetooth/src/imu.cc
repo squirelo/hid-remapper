@@ -19,7 +19,7 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_DBG);
 
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
 
-#define IMU_SAMPLE_RATE_MS 50
+#define IMU_SAMPLE_RATE_MS 16
 #define IMU_VIRTUAL_INTERFACE 0x1000
 
 static const struct device* imu_dev;
@@ -92,13 +92,14 @@ static void imu_work_fn(struct k_work* work) {
     if (gy_dps > 125.0) gy_scaled = 255; else if (gy_dps < -125.0) gy_scaled = 0;
     if (gz_dps > 125.0) gz_scaled = 255; else if (gz_dps < -125.0) gz_scaled = 0;
     
+    // Quick fix: don't know why yet, but gyro and accel data need to be inverted
     imu_report_t imu_report = { 
-        .accel_x = x_scaled,
-        .accel_y = y_scaled,
-        .accel_z = z_scaled,
-        .gyro_x = gx_scaled,
-        .gyro_y = gy_scaled,
-        .gyro_z = gz_scaled
+        .accel_x = gx_scaled,
+        .accel_y = gy_scaled,
+        .accel_z = gz_scaled,
+        .gyro_x = x_scaled,
+        .gyro_y = y_scaled,
+        .gyro_z = z_scaled
     };
     
    
