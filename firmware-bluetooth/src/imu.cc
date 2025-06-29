@@ -15,7 +15,7 @@
 
 LOG_MODULE_REGISTER(imu, LOG_LEVEL_DBG);
 
-#define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
+
 
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
 
@@ -38,8 +38,7 @@ static void imu_work_fn(struct k_work* work) {
         return;
     }
 
-    if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_ACCEL_XYZ) < 0) {
-        LOG_WRN("Accel fetch fail");
+    if (sensor_sample_fetch(imu_dev) < 0) {
         gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
@@ -48,14 +47,6 @@ static void imu_work_fn(struct k_work* work) {
     if (sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_X, &accel[0]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Y, &accel[1]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Z, &accel[2]) < 0) {
-        LOG_WRN("Accel channel fail");
-        gpio_pin_set_dt(&led0, false);
-        k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
-        return;
-    }
-    
-    if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_GYRO_XYZ) < 0) {
-        LOG_WRN("Gyro fetch fail");
         gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
@@ -64,7 +55,6 @@ static void imu_work_fn(struct k_work* work) {
     if (sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_X, &gyro[0]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Y, &gyro[1]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Z, &gyro[2]) < 0) {
-        LOG_WRN("Gyro channel fail");
         gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
@@ -101,6 +91,7 @@ static void imu_work_fn(struct k_work* work) {
     if (gx_dps > 125.0) gx_scaled = 255; else if (gx_dps < -125.0) gx_scaled = 0;
     if (gy_dps > 125.0) gy_scaled = 255; else if (gy_dps < -125.0) gy_scaled = 0;
     if (gz_dps > 125.0) gz_scaled = 255; else if (gz_dps < -125.0) gz_scaled = 0;
+    
     imu_report_t imu_report = { 
         .accel_x = x_scaled,
         .accel_y = y_scaled,
@@ -147,26 +138,17 @@ bool imu_init() {
     accel_scale_attr.val1 = 2;
     accel_scale_attr.val2 = 0;
 
-    if (sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
-                        SENSOR_ATTR_FULL_SCALE, &accel_scale_attr) < 0) {
-        LOG_WRN("Cannot set full scale for accelerometer");
-    }
+    sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
+                     SENSOR_ATTR_FULL_SCALE, &accel_scale_attr);
 
     struct sensor_value gyro_scale_attr;
     gyro_scale_attr.val1 = 125;
     gyro_scale_attr.val2 = 0;
 
-    if (sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
-                        SENSOR_ATTR_FULL_SCALE, &gyro_scale_attr) < 0) {
-        LOG_WRN("Cannot set full scale for gyroscope");
-    }
-    if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_ACCEL_XYZ) < 0) {
-        LOG_ERR("Initial accelerometer sample fetch failed");
-        return false;
-    }
-    
-    if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_GYRO_XYZ) < 0) {
-        LOG_ERR("Initial gyroscope sample fetch failed");
+    sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
+                     SENSOR_ATTR_FULL_SCALE, &gyro_scale_attr);
+    if (sensor_sample_fetch(imu_dev) < 0) {
+        LOG_ERR("Initial sensor sample fetch failed");
         return false;
     }
 
