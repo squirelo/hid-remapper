@@ -88,21 +88,21 @@ static void imu_work_fn(struct k_work* work) {
     double gy_dps = gy_rads * 180.0 / 3.14159;
     double gz_dps = gz_rads * 180.0 / 3.14159;
     
-    uint8_t x_scaled = (uint8_t)(128 + (x_g * 64));
-    uint8_t y_scaled = (uint8_t)(128 + (y_g * 64));
-    uint8_t z_scaled = (uint8_t)(128 + (z_g * 64));
+    uint8_t x_scaled = (uint8_t)(128 + (x_g * 128));
+    uint8_t y_scaled = (uint8_t)(128 + (y_g * 128));
+    uint8_t z_scaled = (uint8_t)(128 + (z_g * 128));
     
-    uint8_t gx_scaled = (uint8_t)(128 + (gx_dps * 128 / 250));
-    uint8_t gy_scaled = (uint8_t)(128 + (gy_dps * 128 / 250));
-    uint8_t gz_scaled = (uint8_t)(128 + (gz_dps * 128 / 250));
+    uint8_t gx_scaled = (uint8_t)(128 + (gx_dps * 128 / 125));
+    uint8_t gy_scaled = (uint8_t)(128 + (gy_dps * 128 / 125));
+    uint8_t gz_scaled = (uint8_t)(128 + (gz_dps * 128 / 125));
     
-    if (x_g > 2.0) x_scaled = 255; else if (x_g < -2.0) x_scaled = 0;
-    if (y_g > 2.0) y_scaled = 255; else if (y_g < -2.0) y_scaled = 0;
-    if (z_g > 2.0) z_scaled = 255; else if (z_g < -2.0) z_scaled = 0;
+    if (x_g > 1.0) x_scaled = 255; else if (x_g < -1.0) x_scaled = 0;
+    if (y_g > 1.0) y_scaled = 255; else if (y_g < -1.0) y_scaled = 0;
+    if (z_g > 1.0) z_scaled = 255; else if (z_g < -1.0) z_scaled = 0;
     
-    if (gx_dps > 250.0) gx_scaled = 255; else if (gx_dps < -250.0) gx_scaled = 0;
-    if (gy_dps > 250.0) gy_scaled = 255; else if (gy_dps < -250.0) gy_scaled = 0;
-    if (gz_dps > 250.0) gz_scaled = 255; else if (gz_dps < -250.0) gz_scaled = 0;
+    if (gx_dps > 125.0) gx_scaled = 255; else if (gx_dps < -125.0) gx_scaled = 0;
+    if (gy_dps > 125.0) gy_scaled = 255; else if (gy_dps < -125.0) gy_scaled = 0;
+    if (gz_dps > 125.0) gz_scaled = 255; else if (gz_dps < -125.0) gz_scaled = 0;
     imu_report_t imu_report = { 
         .accel_x = x_scaled,
         .accel_y = y_scaled,
@@ -155,7 +155,7 @@ bool imu_init() {
     }
 
     struct sensor_value gyro_scale_attr;
-    gyro_scale_attr.val1 = 250;
+    gyro_scale_attr.val1 = 125;
     gyro_scale_attr.val2 = 0;
 
     if (sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
