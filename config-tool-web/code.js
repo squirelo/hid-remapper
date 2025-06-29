@@ -24,6 +24,7 @@ const MACRO_ITEMS_IN_PACKET = 6;
 const IGNORE_AUTH_DEV_INPUTS_FLAG = 1 << 4;
 const GPIO_OUTPUT_MODE_FLAG = 1 << 5;
 const NORMALIZE_GAMEPAD_INPUTS_FLAG = 1 << 6;
+const IMU_ENABLE_FLAG = 1 << 7;
 const HUB_PORT_NONE = 255;
 
 const QUIRK_FLAG_RELATIVE_MASK = 0b10000000;
@@ -148,6 +149,7 @@ let config = {
     'gpio_output_mode': 0,
     'input_labels': 0,
     'normalize_gamepad_inputs': true,
+    'imu_enabled': false,
     mappings: [{
         'source_usage': '0x00000000',
         'target_usage': '0x00000000',
@@ -210,6 +212,7 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("input_labels_modal_dropdown").addEventListener("change", input_labels_onchange("input_labels_modal_dropdown"));
     document.getElementById("ignore_auth_dev_inputs_checkbox").addEventListener("change", ignore_auth_dev_inputs_onchange);
     document.getElementById("normalize_gamepad_inputs_checkbox").addEventListener("change", normalize_gamepad_inputs_onchange);
+    document.getElementById("imu_enabled_checkbox").addEventListener("change", imu_enabled_onchange);
 
     document.getElementById("nav-monitor-tab").addEventListener("shown.bs.tab", monitor_tab_shown);
     document.getElementById("nav-monitor-tab").addEventListener("hide.bs.tab", monitor_tab_hide);
@@ -304,6 +307,7 @@ async function load_from_device() {
         config['ignore_auth_dev_inputs'] = !!(flags & IGNORE_AUTH_DEV_INPUTS_FLAG);
         config['gpio_output_mode'] = (flags & GPIO_OUTPUT_MODE_FLAG) ? 1 : 0;
         config['normalize_gamepad_inputs'] = !!(flags & NORMALIZE_GAMEPAD_INPUTS_FLAG);
+        config['imu_enabled'] = !!(flags & IMU_ENABLE_FLAG);
         config['macro_entry_duration'] = macro_entry_duration + 1;
         config['mappings'] = [];
 
@@ -442,7 +446,8 @@ async function save_to_device() {
         await send_feature_command(SUSPEND);
         const flags = (config['ignore_auth_dev_inputs'] ? IGNORE_AUTH_DEV_INPUTS_FLAG : 0) |
             (config['gpio_output_mode'] ? GPIO_OUTPUT_MODE_FLAG : 0) |
-            (config['normalize_gamepad_inputs'] ? NORMALIZE_GAMEPAD_INPUTS_FLAG : 0);
+            (config['normalize_gamepad_inputs'] ? NORMALIZE_GAMEPAD_INPUTS_FLAG : 0) |
+            (config['imu_enabled'] ? IMU_ENABLE_FLAG : 0);
         await send_feature_command(SET_CONFIG, [
             [UINT8, flags],
             [UINT8, layer_list_to_mask(config['unmapped_passthrough_layers'])],
@@ -632,6 +637,7 @@ function set_config_ui_state() {
     document.getElementById('input_labels_dropdown').value = config['input_labels'];
     document.getElementById('input_labels_modal_dropdown').value = config['input_labels'];
     document.getElementById('normalize_gamepad_inputs_checkbox').checked = config['normalize_gamepad_inputs'];
+    document.getElementById('imu_enabled_checkbox').checked = config['imu_enabled'];
 }
 
 function set_mappings_ui_state() {
@@ -1425,6 +1431,10 @@ function ignore_auth_dev_inputs_onchange() {
 
 function normalize_gamepad_inputs_onchange() {
     config['normalize_gamepad_inputs'] = document.getElementById("normalize_gamepad_inputs_checkbox").checked;
+}
+
+function imu_enabled_onchange() {
+    config['imu_enabled'] = document.getElementById("imu_enabled_checkbox").checked;
 }
 
 function macro_entry_duration_onchange() {

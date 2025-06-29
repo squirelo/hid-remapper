@@ -37,11 +37,13 @@ gpio_output_mode = config.get("gpio_output_mode", 0)
 normalize_gamepad_inputs = (
     config.get("normalize_gamepad_inputs", True) if version >= 18 else False
 )
+imu_enabled = config.get("imu_enabled", False)
 
 flags = 0
 flags |= IGNORE_AUTH_DEV_INPUTS_FLAG if ignore_auth_dev_inputs else 0
 flags |= GPIO_OUTPUT_MODE_FLAG if gpio_output_mode == 1 else 0
 flags |= NORMALIZE_GAMEPAD_INPUTS_FLAG if normalize_gamepad_inputs else 0
+flags |= IMU_ENABLE_FLAG if imu_enabled else 0
 
 data = struct.pack(
     "<BBBBBLBLBBB12B",

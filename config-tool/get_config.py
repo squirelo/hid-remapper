@@ -45,6 +45,7 @@ config = {
     "gpio_output_mode": 1 if (flags & GPIO_OUTPUT_MODE_FLAG) else 0,
     "input_labels": 0,
     "normalize_gamepad_inputs": bool(flags & NORMALIZE_GAMEPAD_INPUTS_FLAG),
+    "imu_enabled": bool(flags & IMU_ENABLE_FLAG),
     "mappings": [],
     "macros": [],
     "expressions": [],

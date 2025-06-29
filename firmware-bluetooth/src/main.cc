@@ -924,8 +924,12 @@ int main() {
     
     // Initialize 6-axis IMU AFTER mapping system is ready
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
-    if (!imu_init()) {
-        LOG_ERR("Failed to initialize 6-axis IMU");
+    if (imu_enabled) {
+        if (!imu_init()) {
+            LOG_ERR("Failed to initialize 6-axis IMU");
+        }
+    } else {
+        LOG_INF("IMU disabled in configuration - skipping IMU initialization");
     }
 #else
     LOG_INF("IMU not available on this board - skipping IMU initialization");
