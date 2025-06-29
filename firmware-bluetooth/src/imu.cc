@@ -29,8 +29,6 @@ static K_WORK_DELAYABLE_DEFINE(imu_work, imu_work_fn);
 extern const struct gpio_dt_spec led0;
 extern struct k_work_delayable activity_led_off_work;
 
-extern void handle_received_report(const uint8_t* report, int len, uint16_t interface, uint8_t external_report_id);
-
 static void imu_work_fn(struct k_work* work) {
     struct sensor_value accel[3];
     struct sensor_value gyro[3];
