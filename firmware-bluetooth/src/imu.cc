@@ -17,30 +17,20 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_DBG);
 
 #define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
 
-// Check if IMU device exists in device tree
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
 
 #define IMU_SAMPLE_RATE_MS 50
-#define IMU_VIRTUAL_INTERFACE 0x0000  // Virtual interface ID for 6-axis IMU
+#define IMU_VIRTUAL_INTERFACE 0x1000
 
-// 6-axis IMU support (accelerometer + gyroscope)
 static const struct device* imu_dev;
 static void imu_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(imu_work, imu_work_fn);
 
-// External LED references (assuming these are available globally)
 extern const struct gpio_dt_spec led0;
 extern struct k_work_delayable activity_led_off_work;
 
-// Add IMU trigger support
-#ifdef CONFIG_LSM6DSL_TRIGGER
-static void imu_trigger_handler(const struct device *dev, const struct sensor_trigger *trig) {
-    /* Schedule work to handle sensor reading in main thread context */
-    k_work_submit((struct k_work*)&imu_work);
-}
-#endif
+extern void handle_received_report(const uint8_t* report, int len, uint16_t interface, uint8_t external_report_id);
 
-/* Called every 50 ms (20 Hz) to read IMU (accel + gyro) and queue/process it */
 static void imu_work_fn(struct k_work* work) {
     struct sensor_value accel[3];
     struct sensor_value gyro[3];
@@ -50,48 +40,42 @@ static void imu_work_fn(struct k_work* work) {
         return;
     }
 
-    /* Fetch accelerometer data */
     if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_ACCEL_XYZ) < 0) {
         LOG_WRN("Accel fetch fail");
-        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+        gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
     }
     
-    /* Get accelerometer channel values */
     if (sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_X, &accel[0]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Y, &accel[1]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Z, &accel[2]) < 0) {
         LOG_WRN("Accel channel fail");
-        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+        gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
     }
     
-    /* Fetch gyroscope data */
     if (sensor_sample_fetch_chan(imu_dev, SENSOR_CHAN_GYRO_XYZ) < 0) {
         LOG_WRN("Gyro fetch fail");
-        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+        gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
     }
     
-    /* Get gyroscope channel values */
     if (sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_X, &gyro[0]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Y, &gyro[1]) < 0 ||
         sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Z, &gyro[2]) < 0) {
         LOG_WRN("Gyro channel fail");
-        gpio_pin_set_dt(&led0, false);  // Turn off LED on failure
+        gpio_pin_set_dt(&led0, false);
         k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
         return;
     }
     
-    /* Convert accelerometer to double values */
     double x_ms2 = sensor_value_to_double(&accel[0]);
     double y_ms2 = sensor_value_to_double(&accel[1]);
     double z_ms2 = sensor_value_to_double(&accel[2]);
     
-    /* Convert gyroscope to double values (rad/s) */
     double gx_rads = sensor_value_to_double(&gyro[0]);
     double gy_rads = sensor_value_to_double(&gyro[1]);
     double gz_rads = sensor_value_to_double(&gyro[2]);
@@ -128,15 +112,14 @@ static void imu_work_fn(struct k_work* work) {
         .gyro_z = gz_scaled
     };
     
-    handle_received_report((uint8_t*)&imu_report, sizeof(imu_report), IMU_VIRTUAL_INTERFACE);
+   
+    handle_received_report((uint8_t*)&imu_report, (int)sizeof(imu_report), IMU_VIRTUAL_INTERFACE);
 
     k_work_cancel_delayable(&activity_led_off_work);
     gpio_pin_set_dt(&led0, true);
     k_work_reschedule(&activity_led_off_work, K_MSEC(50));
 
-#ifndef CONFIG_LSM6DSL_TRIGGER
     k_work_reschedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
-#endif
 }
 
 bool imu_init() {
@@ -194,18 +177,7 @@ bool imu_init() {
     
     their_descriptor_updated = true;
 
-#ifdef CONFIG_LSM6DSL_TRIGGER
-    struct sensor_trigger trig;
-    trig.type = SENSOR_TRIG_DATA_READY;
-    trig.chan = SENSOR_CHAN_ACCEL_XYZ;
-
-    if (sensor_trigger_set(imu_dev, &trig, imu_trigger_handler) < 0) {
-        LOG_WRN("Could not set sensor trigger, falling back to polling");
-        k_work_schedule(&imu_work, K_MSEC(1000));
-    }
-#else
-    k_work_schedule(&imu_work, K_MSEC(1000));
-#endif
+    k_work_schedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
 
     return true;
 }
