@@ -14,9 +14,13 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
-// LED1 configuration - Device Tree approach (Green LED)
+// LED1 configuration - Device Tree approach (Blue LED)
 #define LED1_NODE DT_ALIAS(led1)
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
+
+// LED0 configuration - Device Tree approach (Red LED)
+#define LED0_NODE DT_ALIAS(led0)
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
 // Function to blink LED1 on error
 static void led1_blink_error(void)
@@ -56,8 +60,8 @@ static void lsm6dsl_trigger_handler(const struct device *dev,
 
 	LOG_DBG("Trigger handler called, count: %d", lsm6dsl_trig_cnt);
 	
-	// Toggle LED1 on each trigger
-	gpio_pin_toggle_dt(&led1);
+	// Toggle RED LED (led0) on each sensor data trigger
+	gpio_pin_toggle_dt(&led0);
 
 	sensor_sample_fetch_chan(dev, SENSOR_CHAN_ACCEL_XYZ);
 	sensor_channel_get(dev, SENSOR_CHAN_ACCEL_X, &accel_x);
@@ -120,11 +124,11 @@ int main(void)
 	int cnt = 0;
 	char out_str[64];
 	struct sensor_value odr_attr;
-	const struct device *const lsm6dsl_dev = DEVICE_DT_GET_ONE(st_lsm6dsl);
+	const struct device *const lsm6dsl_dev = DEVICE_DT_GET(DT_ALIAS(accel0));
 
 	LOG_INF("Starting HID Remapper Bluetooth firmware");
 
-	// Initialize LED1 - Device Tree approach
+	// Initialize LED1 (Blue LED) - Device Tree approach
 	if (!device_is_ready(led1.port)) {
 		LOG_ERR("LED1 GPIO device not ready");
 		return 0;
@@ -137,10 +141,34 @@ int main(void)
 		return 0;
 	}
 
-	LOG_INF("LED1 initialized successfully");
+	LOG_INF("LED1 (Blue) initialized successfully");
 	
-	// Turn on LED1 to indicate startup
-	gpio_pin_set_dt(&led1, 1);
+	// Initialize LED0 (Red LED) - Device Tree approach
+	if (!device_is_ready(led0.port)) {
+		LOG_ERR("LED0 GPIO device not ready");
+		return 0;
+	}
+
+	ret = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure LED0 GPIO: %d", ret);
+		led1_blink_error();
+		return 0;
+	}
+
+	LOG_INF("LED0 (Red) initialized successfully");
+	
+	// Turn off red LED initially
+	gpio_pin_set_dt(&led0, 0);
+	
+	// LED Pattern: 2 quick blinks on BLUE LED = Both LEDs initialized
+	for (int i = 0; i < 2; i++) {
+		gpio_pin_set_dt(&led1, 1);
+		k_sleep(K_MSEC(100));
+		gpio_pin_set_dt(&led1, 0);
+		k_sleep(K_MSEC(100));
+	}
+	k_sleep(K_MSEC(500));
 
 	if (!device_is_ready(lsm6dsl_dev)) {
 		LOG_ERR("LSM6DSL sensor device not ready");
@@ -149,6 +177,15 @@ int main(void)
 	}
 
 	LOG_INF("LSM6DSL sensor device ready");
+	
+	// LED Pattern: 3 quick blinks on BLUE LED = Sensor device ready
+	for (int i = 0; i < 3; i++) {
+		gpio_pin_set_dt(&led1, 1);
+		k_sleep(K_MSEC(100));
+		gpio_pin_set_dt(&led1, 0);
+		k_sleep(K_MSEC(100));
+	}
+	k_sleep(K_MSEC(500));
 
 	/* set accel/gyro sampling frequency to 104 Hz */
 	odr_attr.val1 = 104;
@@ -171,6 +208,15 @@ int main(void)
 	}
 
 	LOG_DBG("Gyroscope sampling frequency set to 104 Hz");
+	
+	// LED Pattern: 4 quick blinks on BLUE LED = Sensor frequency configured
+	for (int i = 0; i < 4; i++) {
+		gpio_pin_set_dt(&led1, 1);
+		k_sleep(K_MSEC(100));
+		gpio_pin_set_dt(&led1, 0);
+		k_sleep(K_MSEC(100));
+	}
+	k_sleep(K_MSEC(500));
 
 #ifdef CONFIG_LSM6DSL_TRIGGER
 	struct sensor_trigger trig;
@@ -185,6 +231,15 @@ int main(void)
 	}
 
 	LOG_INF("Sensor trigger configured successfully");
+	
+	// LED Pattern: 5 quick blinks on BLUE LED = Trigger configured successfully
+	for (int i = 0; i < 5; i++) {
+		gpio_pin_set_dt(&led1, 1);
+		k_sleep(K_MSEC(100));
+		gpio_pin_set_dt(&led1, 0);
+		k_sleep(K_MSEC(100));
+	}
+	k_sleep(K_MSEC(500));
 #endif
 
 	if (sensor_sample_fetch(lsm6dsl_dev) < 0) {
@@ -195,6 +250,10 @@ int main(void)
 
 	LOG_INF("Initial sensor sample fetch successful");
 	LOG_INF("Entering main sensor loop");
+	
+	// BLUE LED: Solid ON = Everything initialized successfully, entering main loop
+	// RED LED: Will toggle on each sensor data interrupt
+	gpio_pin_set_dt(&led1, 1);
 
 	while (1) {
 		/* Erase previous */

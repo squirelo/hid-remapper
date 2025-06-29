@@ -6,6 +6,8 @@
 
 /dts-v1/;
 #include <nordic/nrf52840_qiaa.dtsi>
+#include <zephyr/dt-bindings/i2c/i2c.h>
+#include <zephyr/dt-bindings/gpio/nordic-nrf-gpio.h>
 #include "seeed_xiao_nrf52840-pinctrl.dtsi"
 
 / {
@@ -48,6 +50,16 @@
 		led0 = &led0;
 		led1 = &led1;
 		sw0 = &button0;
+		accel0 = &lsm6ds3tr_c;
+	};
+
+	lsm6ds3tr-c-en {
+		compatible = "regulator-fixed-sync", "regulator-fixed";
+		enable-gpios = <&gpio1 8 (NRF_GPIO_DRIVE_S0H1 | GPIO_ACTIVE_HIGH)>;
+		regulator-name = "LSM6DS3TR_C_EN";
+		regulator-boot-on;
+		regulator-always-on;
+		startup-delay-us = <10000>;
 	};
 };
 
@@ -77,11 +89,22 @@
 };
 
 &i2c0 {
-	compatible = "nordic,nrf-twi";
+	compatible = "nordic,nrf-twim";
+	/* Cannot be used together with spi0. */
 	status = "okay";
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	
+	zephyr,concat-buf-size = <48>;
+
+	lsm6ds3tr_c: lsm6ds3tr-c@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		irq-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
 };
 
 &spi1 {
