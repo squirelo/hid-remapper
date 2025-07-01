@@ -22,6 +22,8 @@
 #define DEG_TO_RAD (PI / 180.0)
 #define RAD_TO_DEG (180.0 / PI)
 #define GYRO_DEADZONE 0.02
+#define MAHONY_KP 2.0f
+#define MAHONY_KI 0.005f
 
 static const struct device* imu_dev;
 static void imu_work_fn(struct k_work* work);
@@ -52,17 +54,21 @@ static double alpha = 0.9;
 extern const struct gpio_dt_spec led0;
 extern struct k_work_delayable activity_led_off_work;
 
-static uint8_t scale_angle_to_uint8(double angle, double min_angle, double max_angle) {
+static double integral_fbx = 0.0;
+static double integral_fby = 0.0; 
+static double integral_fbz = 0.0;
+
+static uint16_t scale_angle_to_uint16(double angle, double min_angle, double max_angle) {
     if (angle > max_angle) angle = max_angle;
     if (angle < min_angle) angle = min_angle;
     
     double normalized = (angle - min_angle) / (max_angle - min_angle);
-    int scaled = (int)(normalized * 255.0);
+    int scaled = (int)(normalized * 65535.0);
     
-    if (scaled > 255) scaled = 255;
+    if (scaled > 65535) scaled = 65535;
     if (scaled < 0) scaled = 0;
     
-    return (uint8_t)scaled;
+    return (uint16_t)scaled;
 }
 
 static void normalize_yaw(double* yaw) {
@@ -70,25 +76,67 @@ static void normalize_yaw(double* yaw) {
     while (*yaw < 0.0) *yaw += 360.0;
 }
 
-static void integrate_quaternion(double wx, double wy, double wz, double dt) {
-    double qw_dot = 0.5 * (-qx * wx - qy * wy - qz * wz);
-    double qx_dot = 0.5 * ( qw * wx + qy * wz - qz * wy);
-    double qy_dot = 0.5 * ( qw * wy - qx * wz + qz * wx);
-    double qz_dot = 0.5 * ( qw * wz + qx * wy - qy * wx);
-    
-    qw += qw_dot * dt;
-    qx += qx_dot * dt;
-    qy += qy_dot * dt;
-    qz += qz_dot * dt;
-    
-    double norm = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-    if (norm > 0.0) {
-        qw /= norm;
-        qx /= norm;
-        qy /= norm;
-        qz /= norm;
+static void mahony_filter_update(double gx, double gy, double gz, 
+                                double ax, double ay, double az, double dt) {
+    double recipNorm;
+    double vx, vy, vz;
+    double ex, ey, ez;
+    double pa, pb, pc;
+
+    if (!((ax == 0.0) && (ay == 0.0) && (az == 0.0))) {
+        
+        recipNorm = 1.0 / sqrt(ax * ax + ay * ay + az * az);
+        ax *= recipNorm;
+        ay *= recipNorm;
+        az *= recipNorm;
+
+        vx = 2.0 * (qx * qz - qw * qy);
+        vy = 2.0 * (qw * qx + qy * qz);
+        vz = qw * qw - qx * qx - qy * qy + qz * qz;
+
+        ex = (ay * vz - az * vy);
+        ey = (az * vx - ax * vz);
+        ez = (ax * vy - ay * vx);
+        
+        if (MAHONY_KI > 0.0) {
+            integral_fbx += MAHONY_KI * ex * dt;
+            integral_fby += MAHONY_KI * ey * dt;
+            integral_fbz += MAHONY_KI * ez * dt;
+            gx += integral_fbx;
+            gy += integral_fby;
+            gz += integral_fbz;
+        } else {
+            integral_fbx = 0.0;
+            integral_fby = 0.0;
+            integral_fbz = 0.0;
+        }
+
+        gx += MAHONY_KP * ex;
+        gy += MAHONY_KP * ey;
+        gz += MAHONY_KP * ez;
     }
+
+    gx *= (0.5 * dt);
+    gy *= (0.5 * dt);
+    gz *= (0.5 * dt);
+    
+    pa = qx;
+    pb = qy;
+    pc = qz;
+    
+    qw += (-pa * gx - pb * gy - pc * gz);
+    qx += ( qw * gx + pb * gz - pc * gy);
+    qy += ( qw * gy - pa * gz + pc * gx);
+    qz += ( qw * gz + pa * gy - pb * gx);
+
+    recipNorm = 1.0 / sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+    qw *= recipNorm;
+    qx *= recipNorm;
+    qy *= recipNorm;
+    qz *= recipNorm;
 }
+
+
 
 static void quaternion_to_ypr(double* yaw, double* pitch, double* roll) {
     *yaw = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)) * RAD_TO_DEG;
@@ -216,7 +264,7 @@ static void imu_work_fn(struct k_work* work) {
     angular_y = apply_deadzone(angular_y, GYRO_DEADZONE);
     angular_z = apply_deadzone(angular_z, GYRO_DEADZONE);
     
-    integrate_quaternion(angular_x, angular_y, angular_z, dt);
+    mahony_filter_update(angular_x, angular_y, angular_z, accel_x, accel_y, accel_z, dt);
     
     double yaw, pitch, roll;
     quaternion_to_ypr(&yaw, &pitch, &roll);
@@ -233,17 +281,31 @@ static void imu_work_fn(struct k_work* work) {
     hp_prev = hp; 
     lp_prev = lp;
     
-    uint8_t yaw_scaled = scale_angle_to_uint8(yaw_corrected, 0.0, 360.0);
-    uint8_t pitch_scaled = scale_angle_to_uint8(pitch_corrected, -90.0, 90.0);
-    uint8_t roll_scaled = scale_angle_to_uint8(roll_corrected, -180.0, 180.0);
+    uint16_t yaw_scaled = scale_angle_to_uint16(yaw_corrected, 0.0, 360.0);
+    uint16_t pitch_scaled = scale_angle_to_uint16(pitch_corrected, -90.0, 90.0);
+    uint16_t roll_scaled = scale_angle_to_uint16(roll_corrected, -180.0, 180.0);
     
-    uint8_t magnitude_scaled = (uint8_t)(fmin(fabs(hp) * 10.2, 255.0));
+    uint16_t magnitude_scaled = (uint16_t)(fmin(fabs(hp) * 2621.4, 65535.0));
+    
+    int16_t accel_x_raw = (int16_t)(accel_x * 8192.0);
+    int16_t accel_y_raw = (int16_t)(accel_y * 8192.0);
+    int16_t accel_z_raw = (int16_t)(accel_z * 8192.0);
+    
+    int16_t gyro_x_raw = (int16_t)(angular_x * 16.384);
+    int16_t gyro_y_raw = (int16_t)(angular_y * 16.384);  
+    int16_t gyro_z_raw = (int16_t)(angular_z * 16.384);
     
     imu_report_t imu_report = { 
         .yaw = yaw_scaled,
         .pitch = pitch_scaled,
         .roll = roll_scaled,
-        .magnitude = magnitude_scaled
+        .magnitude = magnitude_scaled,
+        .accel_x = accel_x_raw,
+        .accel_y = accel_y_raw,
+        .accel_z = accel_z_raw,
+        .gyro_x = gyro_x_raw,
+        .gyro_y = gyro_y_raw,
+        .gyro_z = gyro_z_raw
     };
     
     handle_received_report((uint8_t*)&imu_report, (int)sizeof(imu_report), IMU_VIRTUAL_INTERFACE);
@@ -277,14 +339,14 @@ bool imu_init() {
     }
 
     struct sensor_value accel_scale_attr;
-    accel_scale_attr.val1 = 2;
+    accel_scale_attr.val1 = 4;
     accel_scale_attr.val2 = 0;
 
     sensor_attr_set(imu_dev, SENSOR_CHAN_ACCEL_XYZ,
                      SENSOR_ATTR_FULL_SCALE, &accel_scale_attr);
 
     struct sensor_value angular_scale_attr;
-    angular_scale_attr.val1 = 125;
+    angular_scale_attr.val1 = 2000;
     angular_scale_attr.val2 = 0;
 
     sensor_attr_set(imu_dev, SENSOR_CHAN_GYRO_XYZ,
