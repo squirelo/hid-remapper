@@ -21,7 +21,6 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_DBG);
 #define IMU_SAMPLE_RATE_MS 16
 #define IMU_VIRTUAL_INTERFACE 0x1000
 #define PI 3.14159265359
-#define FILTER_ALPHA 0.96
 #define CALIBRATION_SAMPLES 200
 #define DEG_TO_RAD (PI / 180.0)
 #define RAD_TO_DEG (180.0 / PI)
@@ -31,9 +30,17 @@ static const struct device* imu_dev;
 static void imu_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(imu_work, imu_work_fn);
 
-static double filtered_pitch = 0.0;
-static double filtered_roll = 0.0;
-static double accumulated_yaw = 0.0;
+// Quaternion state [w, x, y, z]
+static double qw = 1.0;
+static double qx = 0.0;
+static double qy = 0.0;
+static double qz = 0.0;
+
+// Offset calibration (like pitchOffset/rollOffset in Arduino code)
+static double yaw_offset = 0.0;
+static double pitch_offset = 0.0;
+static double roll_offset = 0.0;
+
 static int64_t last_timestamp = 0;
 
 static double gyro_bias_x = 0.0;
@@ -69,9 +76,46 @@ static void normalize_yaw(double* yaw) {
     while (*yaw < 0.0) *yaw += 360.0;
 }
 
-static void compute_accel_angles(double ax, double ay, double az, double* pitch, double* roll) {
-    *pitch = atan2(-ax, sqrt(ay * ay + az * az)) * RAD_TO_DEG;
-    *roll = atan2(ay, az) * RAD_TO_DEG;
+// Quaternion integration from gyroscope data (like MPU6050 DMP)
+static void integrate_quaternion(double wx, double wy, double wz, double dt) {
+    // Quaternion derivative from angular velocity
+    double qw_dot = 0.5 * (-qx * wx - qy * wy - qz * wz);
+    double qx_dot = 0.5 * ( qw * wx + qy * wz - qz * wy);
+    double qy_dot = 0.5 * ( qw * wy - qx * wz + qz * wx);
+    double qz_dot = 0.5 * ( qw * wz + qx * wy - qy * wx);
+    
+    // Integrate
+    qw += qw_dot * dt;
+    qx += qx_dot * dt;
+    qy += qy_dot * dt;
+    qz += qz_dot * dt;
+    
+    // Normalize to maintain unit quaternion
+    double norm = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    if (norm > 0.0) {
+        qw /= norm;
+        qx /= norm;
+        qy /= norm;
+        qz /= norm;
+    }
+}
+
+// Convert quaternion to yaw/pitch/roll (like mpu.dmpGetYawPitchRoll)
+static void quaternion_to_ypr(double* yaw, double* pitch, double* roll) {
+    // Convert quaternion to Euler angles
+    *yaw = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)) * RAD_TO_DEG;
+    *pitch = asin(2.0 * (qw * qy - qz * qx)) * RAD_TO_DEG;
+    *roll = atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy)) * RAD_TO_DEG;
+    
+    // Normalize yaw to 0-360 range
+    normalize_yaw(yaw);
+}
+
+// Calibrate current orientation as "zero" (like button press in Arduino code)
+static void calibrate_orientation(double yaw, double pitch, double roll) {
+    yaw_offset = yaw;
+    pitch_offset = pitch;
+    roll_offset = roll;
 }
 
 static double apply_deadzone(double value, double deadzone) {
@@ -143,6 +187,11 @@ static void imu_work_fn(struct k_work* work) {
     if (!is_calibrated) {
         if (calibrate_sensors()) {
             is_calibrated = true;
+            // After sensor calibration, also calibrate orientation (like Arduino code)
+            // This sets the current orientation as "zero" reference
+            double yaw, pitch, roll;
+            quaternion_to_ypr(&yaw, &pitch, &roll);
+            calibrate_orientation(yaw, pitch, roll);
         } else {
             k_work_reschedule(&imu_work, K_MSEC(1000));
             return;
@@ -183,19 +232,20 @@ static void imu_work_fn(struct k_work* work) {
     angular_y = apply_deadzone(angular_y, GYRO_DEADZONE);
     angular_z = apply_deadzone(angular_z, GYRO_DEADZONE);
     
-    double accel_pitch, accel_roll;
-    compute_accel_angles(accel_x, accel_y, accel_z, &accel_pitch, &accel_roll);
+    // Integrate quaternion from gyroscope data (like MPU6050 DMP)
+    integrate_quaternion(angular_x, angular_y, angular_z, dt);
     
-    double angular_x_deg_s = angular_x * RAD_TO_DEG;
-    double angular_y_deg_s = angular_y * RAD_TO_DEG;
-    double angular_z_deg_s = angular_z * RAD_TO_DEG;
+    // Convert quaternion to yaw/pitch/roll (like mpu.dmpGetYawPitchRoll)
+    double yaw, pitch, roll;
+    quaternion_to_ypr(&yaw, &pitch, &roll);
     
-    filtered_pitch = FILTER_ALPHA * (filtered_pitch + angular_x_deg_s * dt) + (1.0 - FILTER_ALPHA) * accel_pitch;
-    filtered_roll = FILTER_ALPHA * (filtered_roll + angular_y_deg_s * dt) + (1.0 - FILTER_ALPHA) * accel_roll;
+    // Apply offsets (like (ypr[1]-pitchOffset) in Arduino code)
+    double yaw_corrected = yaw - yaw_offset;
+    double pitch_corrected = pitch - pitch_offset;
+    double roll_corrected = roll - roll_offset;
     
-    accumulated_yaw += angular_z_deg_s * dt;
-    
-    normalize_yaw(&accumulated_yaw);
+    // Normalize yaw after offset
+    normalize_yaw(&yaw_corrected);
     
     // Calculate filtered acceleration magnitude
     double accel_mag = sqrt(accel_x * accel_x + accel_y * accel_y + accel_z * accel_z);
@@ -204,9 +254,9 @@ static void imu_work_fn(struct k_work* work) {
     hp_prev = hp; 
     lp_prev = lp;
     
-    uint8_t yaw_scaled = scale_angle_to_uint8(accumulated_yaw, 0.0, 360.0);
-    uint8_t pitch_scaled = scale_angle_to_uint8(filtered_pitch, -90.0, 90.0);
-    uint8_t roll_scaled = scale_angle_to_uint8(filtered_roll, -180.0, 180.0);
+    uint8_t yaw_scaled = scale_angle_to_uint8(yaw_corrected, 0.0, 360.0);
+    uint8_t pitch_scaled = scale_angle_to_uint8(pitch_corrected, -90.0, 90.0);
+    uint8_t roll_scaled = scale_angle_to_uint8(roll_corrected, -180.0, 180.0);
     
     // Scale high-pass filtered magnitude (dynamic acceleration) from 0-25.0 m/s² to 0-255
     // High-pass captures the sudden acceleration changes (taps, shakes, etc.)
@@ -275,6 +325,15 @@ bool imu_init() {
     k_work_schedule(&imu_work, K_MSEC(IMU_SAMPLE_RATE_MS));
 
     return true;
+}
+
+// Function to recalibrate orientation (like button press in Arduino code)
+void imu_recalibrate_orientation() {
+    if (is_calibrated) {
+        double yaw, pitch, roll;
+        quaternion_to_ypr(&yaw, &pitch, &roll);
+        calibrate_orientation(yaw, pitch, roll);
+    }
 }
 
 #else

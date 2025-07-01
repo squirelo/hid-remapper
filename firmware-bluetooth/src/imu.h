@@ -8,3 +8,4 @@ extern const struct gpio_dt_spec led0;
 extern struct k_work_delayable activity_led_off_work;
 
 bool imu_init(); 
+void imu_recalibrate_orientation(); 
