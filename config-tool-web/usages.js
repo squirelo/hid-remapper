@@ -16,6 +16,7 @@ const usages = {
         "0x0020008d": { 'name': 'Yaw', 'class': 'mouse' },
         "0x0020008e": { 'name': 'Pitch', 'class': 'mouse' },
         "0x0020008f": { 'name': 'Roll', 'class': 'mouse' },
+        "0x00200090": { 'name': 'Magnitude', 'class': 'mouse' },
     },
     'source_1': {
         "0x00010030": { 'name': 'Left stick X', 'class': 'gamepad' },
@@ -207,6 +208,7 @@ const usages = {
         "0x0020008d": { 'name': 'Yaw', 'class': 'mouse' },
         "0x0020008e": { 'name': 'Pitch', 'class': 'mouse' },
         "0x0020008f": { 'name': 'Roll', 'class': 'mouse' },
+        "0x00200090": { 'name': 'Magnitude', 'class': 'mouse' },
         "0xfff30001": { 'name': 'Expression 1', 'class': 'other' },
         "0xfff30002": { 'name': 'Expression 2', 'class': 'other' },
         "0xfff30003": { 'name': 'Expression 3', 'class': 'other' },
@@ -437,6 +439,7 @@ const usages = {
         "0x0020008d": { 'name': 'Yaw', 'class': 'mouse' },
         "0x0020008e": { 'name': 'Pitch', 'class': 'mouse' },
         "0x0020008f": { 'name': 'Roll', 'class': 'mouse' },
+        "0x00200090": { 'name': 'Magnitude', 'class': 'mouse' },
     },
     2: {
         "0x00090001": { 'name': 'Y', 'class': 'mouse' },

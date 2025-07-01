@@ -44,6 +44,10 @@ static double accel_bias_y = 0.0;
 static double accel_bias_z = 0.0;
 static bool is_calibrated = false;
 
+// Acceleration magnitude filtering
+static double hp_prev = 0.0, lp_prev = 0.0;
+static double alpha = 0.9;
+
 extern const struct gpio_dt_spec led0;
 extern struct k_work_delayable activity_led_off_work;
 
@@ -193,14 +197,26 @@ static void imu_work_fn(struct k_work* work) {
     
     normalize_yaw(&accumulated_yaw);
     
+    // Calculate filtered acceleration magnitude
+    double accel_mag = sqrt(accel_x * accel_x + accel_y * accel_y + accel_z * accel_z);
+    double lp = alpha * lp_prev + (1.0 - alpha) * accel_mag;  // low-pass
+    double hp = accel_mag - lp;                               // high-pass
+    hp_prev = hp; 
+    lp_prev = lp;
+    
     uint8_t yaw_scaled = scale_angle_to_uint8(accumulated_yaw, 0.0, 360.0);
     uint8_t pitch_scaled = scale_angle_to_uint8(filtered_pitch, -90.0, 90.0);
     uint8_t roll_scaled = scale_angle_to_uint8(filtered_roll, -180.0, 180.0);
     
+    // Scale high-pass filtered magnitude (dynamic acceleration) from 0-25.0 m/s² to 0-255
+    // High-pass captures the sudden acceleration changes (taps, shakes, etc.)
+    uint8_t magnitude_scaled = (uint8_t)(fmin(fabs(hp) * 10.2, 255.0));
+    
     imu_report_t imu_report = { 
         .yaw = yaw_scaled,
         .pitch = pitch_scaled,
-        .roll = roll_scaled
+        .roll = roll_scaled,
+        .magnitude = magnitude_scaled
     };
     
     handle_received_report((uint8_t*)&imu_report, (int)sizeof(imu_report), IMU_VIRTUAL_INTERFACE);
