@@ -2,6 +2,73 @@ import crc32 from './crc.js';
 import usages from './usages.js';
 import examples from './examples.js';
 
+function getStoredTheme() {
+    return localStorage.getItem('theme');
+}
+
+function setStoredTheme(theme) {
+    localStorage.setItem('theme', theme);
+}
+
+function getPreferredTheme() {
+    const storedTheme = getStoredTheme();
+    if (storedTheme) {
+        return storedTheme;
+    }
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function setTheme(theme) {
+    if (theme === 'auto') {
+        document.documentElement.setAttribute('data-bs-theme', 
+            window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    } else {
+        document.documentElement.setAttribute('data-bs-theme', theme);
+    }
+}
+
+function updateThemeToggle(theme) {
+    const themeToggle = document.getElementById('theme-toggle');
+    if (!themeToggle) return;
+    
+    const sunIcon = themeToggle.querySelector('.sun-icon');
+    const moonIcon = themeToggle.querySelector('.moon-icon');
+    
+    if (theme === 'dark') {
+        sunIcon.style.display = 'block';
+        moonIcon.style.display = 'none';
+    } else {
+        sunIcon.style.display = 'none';
+        moonIcon.style.display = 'block';
+    }
+}
+
+function initializeTheme() {
+    const theme = getPreferredTheme();
+    setTheme(theme);
+    // Update toggle after DOM is ready
+    setTimeout(() => updateThemeToggle(theme), 0);
+}
+
+function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-bs-theme');
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    
+    setTheme(newTheme);
+    setStoredTheme(newTheme);
+    updateThemeToggle(newTheme);
+}
+
+initializeTheme();
+
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    const storedTheme = getStoredTheme();
+    if (!storedTheme) {
+        setTheme(getPreferredTheme());
+        updateThemeToggle(getPreferredTheme());
+    }
+});
+
 const REPORT_ID_CONFIG = 100;
 const REPORT_ID_MONITOR = 101;
 const STICKY_FLAG = 1 << 0;
@@ -180,6 +247,9 @@ let modal_return_mapping = null;
 let modal_return_element = null;
 
 document.addEventListener("DOMContentLoaded", function () {
+    // Add theme toggle event listener
+    document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
+    
     document.getElementById("open_device").addEventListener("click", open_device);
     document.getElementById("load_from_device").addEventListener("click", load_from_device);
     document.getElementById("save_to_device").addEventListener("click", save_to_device);
