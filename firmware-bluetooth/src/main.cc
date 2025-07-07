@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "imu.h"
+#include "pdm.h"
 #include "descriptor_parser.h"
 #include "globals.h"
 #include "our_descriptor.h"
@@ -933,6 +934,18 @@ int main() {
     }
 #else
     LOG_INF("IMU not available on this board - skipping IMU initialization");
+#endif
+
+#if DT_NODE_EXISTS(DT_NODELABEL(pdm0))
+    if (pdm_enabled) {
+        if (!pdm_init()) {
+            LOG_ERR("Failed to initialize PDM microphone");
+        }
+    } else {
+        LOG_INF("PDM disabled in configuration - skipping PDM initialization");
+    }
+#else
+    LOG_INF("PDM not available on this board - skipping PDM initialization");
 #endif
 
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));

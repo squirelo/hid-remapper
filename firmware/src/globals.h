@@ -42,6 +42,7 @@ extern bool normalize_gamepad_inputs;
 extern bool imu_enabled;
 extern uint8_t imu_angle_clamp_limit;
 extern uint8_t imu_filter_buffer_size;
+extern bool pdm_enabled;
 
 extern std::vector<mapping_config11_t> config_mappings;
 

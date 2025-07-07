@@ -14,6 +14,7 @@ target_include_directories(app PRIVATE ${REMAPPER_SRC})
 target_sources(app PRIVATE
     src/main.cc
     src/imu.cc
+    src/pdm.cc
     ${REMAPPER_SRC}/config.cc
     ${REMAPPER_SRC}/crc.cc
     ${REMAPPER_SRC}/descriptor_parser.cc
