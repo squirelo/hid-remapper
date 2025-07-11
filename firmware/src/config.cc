@@ -649,6 +649,12 @@ void load_config(const uint8_t* persisted_config) {
             imu_angle_clamp_limit = 90;
         }
         imu_filter_buffer_size = config->imu_filter_buffer_size;
+        if (imu_filter_buffer_size < 1) {
+            imu_filter_buffer_size = 1;
+        }
+        if (imu_filter_buffer_size > 16) {
+            imu_filter_buffer_size = 16;
+        }
         imu_roll_inverted = config->imu_roll_inverted;
         imu_pitch_inverted = config->imu_pitch_inverted;
     }
@@ -1022,6 +1028,12 @@ void handle_set_report1(uint8_t report_id, uint8_t const* buffer, uint16_t bufsi
                         imu_angle_clamp_limit = 90;
                     }
                     imu_filter_buffer_size = config->imu_filter_buffer_size;
+                    if (imu_filter_buffer_size < 1) {
+                        imu_filter_buffer_size = 1;
+                    }
+                    if (imu_filter_buffer_size > 16) {
+                        imu_filter_buffer_size = 16;
+                    }
                     imu_roll_inverted = config->imu_roll_inverted;
                     imu_pitch_inverted = config->imu_pitch_inverted;
                     break;
