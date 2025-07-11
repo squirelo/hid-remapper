@@ -301,8 +301,8 @@ async function load_from_device() {
 
     try {
         await send_feature_command(GET_CONFIG);
-        const [config_version, flags, unmapped_passthrough_layer_mask, partial_scroll_timeout, mapping_count, our_usage_count, their_usage_count, interval_override, tap_hold_threshold, gpio_debounce_time_ms, our_descriptor_number, macro_entry_duration, quirk_count, imu_angle_clamp_limit, imu_filter_buffer_size] =
-            await read_config_feature([UINT8, UINT8, UINT8, UINT32, UINT16, UINT32, UINT32, UINT8, UINT32, UINT8, UINT8, UINT8, UINT16, UINT8, UINT8]);
+        const [config_version, flags, unmapped_passthrough_layer_mask, partial_scroll_timeout, mapping_count, our_usage_count, their_usage_count, interval_override, tap_hold_threshold, gpio_debounce_time_ms, our_descriptor_number, macro_entry_duration, quirk_count, imu_angle_clamp_limit, imu_filter_buffer_size, imu_roll_inverted, imu_pitch_inverted] =
+            await read_config_feature([UINT8, UINT8, UINT8, UINT32, UINT16, UINT32, UINT32, UINT8, UINT32, UINT8, UINT8, UINT8, UINT16, UINT8, UINT8, UINT8, UINT8]);
         check_received_version(config_version);
 
         config['version'] = config_version;
@@ -319,6 +319,8 @@ async function load_from_device() {
         config['macro_entry_duration'] = macro_entry_duration + 1;
         config['imu_angle_clamp_limit'] = imu_angle_clamp_limit;
         config['imu_filter_buffer_size'] = imu_filter_buffer_size;
+        config['imu_roll_inverted'] = !!imu_roll_inverted;
+        config['imu_pitch_inverted'] = !!imu_pitch_inverted;
         config['mappings'] = [];
 
         for (let i = 0; i < mapping_count; i++) {
@@ -469,6 +471,8 @@ async function save_to_device() {
             [UINT8, config['macro_entry_duration'] - 1],
             [UINT8, config['imu_angle_clamp_limit']],
             [UINT8, config['imu_filter_buffer_size']],
+            [UINT8, config['imu_roll_inverted'] ? 1 : 0],
+            [UINT8, config['imu_pitch_inverted'] ? 1 : 0],
         ]);
         await send_feature_command(CLEAR_MAPPING);
 
