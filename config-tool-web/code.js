@@ -221,6 +221,8 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("imu_enabled_checkbox").addEventListener("change", imu_enabled_onchange);
     document.getElementById("imu_angle_clamp_limit_input").addEventListener("change", imu_angle_clamp_limit_onchange);
     document.getElementById("imu_filter_buffer_size_input").addEventListener("change", imu_filter_buffer_size_onchange);
+    document.getElementById("imu_roll_inverted_checkbox").addEventListener("change", imu_roll_inverted_onchange);
+    document.getElementById("imu_pitch_inverted_checkbox").addEventListener("change", imu_pitch_inverted_onchange);
 
     document.getElementById("nav-monitor-tab").addEventListener("shown.bs.tab", monitor_tab_shown);
     document.getElementById("nav-monitor-tab").addEventListener("hide.bs.tab", monitor_tab_hide);
@@ -656,6 +658,8 @@ function set_config_ui_state() {
     document.getElementById('imu_enabled_checkbox').checked = config['imu_enabled'];
     document.getElementById('imu_angle_clamp_limit_input').value = config['imu_angle_clamp_limit'] ?? DEFAULT_IMU_ANGLE_CLAMP_LIMIT;
     document.getElementById('imu_filter_buffer_size_input').value = config['imu_filter_buffer_size'] ?? DEFAULT_IMU_FILTER_BUFFER_SIZE;
+    document.getElementById('imu_roll_inverted_checkbox').checked = config['imu_roll_inverted'] ?? false;
+    document.getElementById('imu_pitch_inverted_checkbox').checked = config['imu_pitch_inverted'] ?? false;
 }
 
 function set_mappings_ui_state() {
@@ -1474,6 +1478,14 @@ function imu_angle_clamp_limit_onchange() {
 
 function imu_filter_buffer_size_onchange() {
     config['imu_filter_buffer_size'] = parseInt(document.getElementById("imu_filter_buffer_size_input").value, 10);
+}
+
+function imu_roll_inverted_onchange() {
+    config['imu_roll_inverted'] = document.getElementById("imu_roll_inverted_checkbox").checked;
+}
+
+function imu_pitch_inverted_onchange() {
+    config['imu_pitch_inverted'] = document.getElementById("imu_pitch_inverted_checkbox").checked;
 }
 
 function macro_entry_duration_onchange() {
