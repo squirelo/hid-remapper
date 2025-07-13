@@ -201,7 +201,7 @@ struct __attribute__((packed)) set_feature_t {
 };
 
 struct __attribute__((packed)) get_feature_t {
-    uint8_t data[28];
+    uint8_t data[32];
     uint32_t crc32;
 };
 
