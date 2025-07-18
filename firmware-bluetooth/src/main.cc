@@ -284,27 +284,26 @@ static bool is_joycon2_device(const struct bt_scan_device_info* device_info) {
     // Check manufacturer data
     const struct bt_data* adv = device_info->adv_data;
     size_t adv_len = device_info->adv_data_len;
-    size_t i = 0;
-    while (i + 1 < adv_len) {
-        uint8_t len = adv[i];
-        if (len == 0 || i + len >= adv_len) break;
-        uint8_t type = adv[i + 1];
-        if (type == BT_DATA_MANUFACTURER_DATA && len >= 3) {
-            uint16_t company_id = adv[i + 2] | (adv[i + 3] << 8);
+    
+    for (size_t i = 0; i < adv_len; i++) {
+        const struct bt_data* data = &adv[i];
+        
+        if (data->type == BT_DATA_MANUFACTURER_DATA && data->data_len >= 2) {
+            uint16_t company_id = data->data[0] | (data->data[1] << 8);
             if (company_id == JOYCON2_MANUFACTURER_ID) {
                 return true;
             }
         }
-        if (type == BT_DATA_NAME_COMPLETE || type == BT_DATA_NAME_SHORTENED) {
+        
+        if (data->type == BT_DATA_NAME_COMPLETE || data->type == BT_DATA_NAME_SHORTENED) {
             char name[32] = {0};
-            size_t name_len = len - 1;
+            size_t name_len = data->data_len;
             if (name_len > sizeof(name) - 1) name_len = sizeof(name) - 1;
-            memcpy(name, &adv[i + 2], name_len);
+            memcpy(name, data->data, name_len);
             if (strstr(name, JOYCON2_LEFT_NAME) || strstr(name, JOYCON2_RIGHT_NAME)) {
                 return true;
             }
         }
-        i += len + 1;
     }
     return false;
 }
@@ -388,9 +387,10 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
             }
             if (needs_fix) {
                 bt_uuid_to_str(attr->uuid, str1, sizeof(str2));
+                uint16_t uuid_val = (BT_UUID_128(attr->uuid)->val[13] << 8) | BT_UUID_128(attr->uuid)->val[12];
                 *((bt_uuid_16*) attr->uuid) = {
                     .uuid = { BT_UUID_TYPE_16 },
-                    .val = (BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
+                    .val = uuid_val
                 };
                 bt_uuid_to_str(attr->uuid, str2, sizeof(str2));
                 LOG_INF("%s -> %s", str1, str2);
@@ -910,6 +910,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;
 }
 
 static void button_init() {
