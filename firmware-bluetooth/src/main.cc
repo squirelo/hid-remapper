@@ -289,15 +289,32 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
 
     LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
 
+    // Check if this is a Joy-Con 2 device
     if (joycon2_is_device(device_info)) {
         LOG_INF("Joy-Con 2 detected at %s", addr);
+        
         // Store device info for later use in connection
         for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
             if (!joycon2_is_connection(i)) {
                 joycon2_store_device_info(device_info, i);
+                LOG_INF("Joy-Con 2 device info stored for connection %d", i);
                 break;
             }
         }
+        
+        // Also check for device name in advertisement data
+        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
+        
+        // In Zephyr, advertisement data is accessed through net_buf_simple
+        // We need to parse the advertisement data to find device name
+        char addr[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(recv_info->addr, addr, sizeof(addr));
+        
+        LOG_INF("Checking device at %s for Joy-Con 2", addr);
+        
+        // TODO: Implement proper advertisement data parsing using net_buf_simple
+        // The advertisement data should be accessed through a separate parameter
+        // in the scan callback function, not through recv_info->data
     }
 }
 
@@ -360,7 +377,7 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
 }
 
 static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
-    LOG_INF("");
+    LOG_INF("GATT discovery completed");
     patch_broken_uuids(dm);
     
     struct bt_hogp* hogp = (struct bt_hogp*) context;
@@ -374,9 +391,14 @@ static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
         
         // Enable sensors for Joy-Con 2
         struct joycon2_connection* joycon2_conn = joycon2_find_connection(conn);
-        if (joycon2_conn) {
+        if (joycon2_conn && joycon2_conn->write_handle != 0) {
+            LOG_INF("Enabling Joy-Con 2 sensors on write handle: 0x%04x", joycon2_conn->write_handle);
             joycon2_enable_sensors(conn, joycon2_conn->write_handle);
+        } else {
+            LOG_WRN("Joy-Con 2 write handle not found, cannot enable sensors");
         }
+    } else {
+        LOG_INF("Standard HID device discovery completed");
     }
     
     CHK(bt_hogp_handles_assign(dm, hogp));

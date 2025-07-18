@@ -3,17 +3,18 @@
 #include <zephyr/kernel.h>
 #include <string.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/sys/byteorder.h>
 
 LOG_MODULE_REGISTER(joycon2, LOG_LEVEL_DBG);
 
 // Joy-Con 2 GATT UUIDs - using manual initialization to avoid macro issues
 static const struct bt_uuid_128 joycon2_input_report_uuid = {
     .uuid = { BT_UUID_TYPE_128 },
-    .val = JOYCON2_INPUT_REPORT_UUID_VAL
+    .val = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
 };
 static const struct bt_uuid_128 joycon2_write_command_uuid = {
     .uuid = { BT_UUID_TYPE_128 },
-    .val = JOYCON2_WRITE_COMMAND_UUID_VAL
+    .val = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
 };
 
 // Joy-Con 2 connection management
@@ -34,11 +35,29 @@ struct report_type {
 // Forward declarations for report handling
 extern struct k_msgq report_q;
 
+// Helper function to get 16-bit little-endian value
+static inline uint16_t get_le16(const uint8_t* buf) {
+    return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
 bool joycon2_is_device(const struct bt_scan_device_info* device_info) {
-    // For now, we'll use a simplified approach since the scan API has changed
-    // We'll rely on the main scanning logic to identify Joy-Con 2 devices
-    // This function will be called from the main scan callback
-    return false; // Placeholder - will be implemented when scan API is available
+    // Check manufacturer data for Nintendo Joy-Con
+    // Use the correct Zephyr API to access advertisement data
+    const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
+    
+    // In Zephyr, advertisement data is accessed through net_buf_simple
+    // We need to parse the advertisement data to find manufacturer specific data
+    // For now, let's use a simpler approach - check by device name
+    char addr[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(recv_info->addr, addr, sizeof(addr));
+    
+    LOG_INF("Checking device at %s for Joy-Con 2", addr);
+    
+    // TODO: Implement proper advertisement data parsing using net_buf_simple
+    // The advertisement data should be accessed through a separate parameter
+    // in the scan callback function, not through recv_info->data
+    
+    return false;
 }
 
 void joycon2_store_device_info(const struct bt_scan_device_info* device_info, uint8_t conn_idx) {
@@ -55,19 +74,39 @@ bool joycon2_is_connection(uint8_t conn_idx) {
 }
 
 void joycon2_discover_characteristics(struct bt_conn* conn, void* dm) {
-    // For now, we'll use a simplified approach since the GATT discovery API has changed
-    // This function will be called from the main discovery callback
     LOG_INF("Joy-Con 2 discovery characteristics called");
     
-    // We'll need to implement proper GATT discovery later
-    // For now, just log that we're here
     if (joycon2_count < MAX_JOYCON2) {
         joycon2_conns[joycon2_count].conn = conn;
-        joycon2_conns[joycon2_count].input_handle = 0;  // Will be set later
-        joycon2_conns[joycon2_count].write_handle = 0;  // Will be set later
+        joycon2_conns[joycon2_count].input_handle = 0;
+        joycon2_conns[joycon2_count].write_handle = 0;
         joycon2_conns[joycon2_count].sensors_enabled = false;
+        
+        // Parse GATT discovery data to find Joy-Con characteristics
+        const struct bt_gatt_dm* gatt_dm = (const struct bt_gatt_dm*)dm;
+        const struct bt_gatt_dm_attr* attr = NULL;
+        while (NULL != (attr = bt_gatt_dm_attr_next(gatt_dm, attr))) {
+            if (attr->uuid->type == BT_UUID_TYPE_128) {
+                const struct bt_uuid_128* uuid = (const struct bt_uuid_128*)attr->uuid;
+                
+                // Check for input report characteristic
+                if (memcmp(uuid->val, JOYCON2_INPUT_REPORT_UUID_VAL, 16) == 0) {
+                    joycon2_conns[joycon2_count].input_handle = attr->handle;
+                    LOG_INF("Found Joy-Con input report characteristic at handle: 0x%04x", attr->handle);
+                }
+                
+                // Check for write command characteristic
+                if (memcmp(uuid->val, JOYCON2_WRITE_COMMAND_UUID_VAL, 16) == 0) {
+                    joycon2_conns[joycon2_count].write_handle = attr->handle;
+                    LOG_INF("Found Joy-Con write command characteristic at handle: 0x%04x", attr->handle);
+                }
+            }
+        }
+        
         joycon2_count++;
-        LOG_INF("Joy-Con 2 connection added (handles to be discovered)");
+        LOG_INF("Joy-Con 2 connection added with input_handle: 0x%04x, write_handle: 0x%04x", 
+                joycon2_conns[joycon2_count-1].input_handle, 
+                joycon2_conns[joycon2_count-1].write_handle);
     }
 }
 
@@ -116,29 +155,31 @@ void joycon2_decode_and_handle_report(const uint8_t* data, uint8_t len, uint16_t
     }
 
     uint8_t report_id = data[0];
-    const uint8_t* report_data = data + 1;
-    uint8_t report_len = len - 1;
+    LOG_INF("[Joy-Con 2] Received report ID: %d, len: %d, interface: 0x%04x", report_id, len, interface);
 
-    LOG_INF("[Joy-Con 2] Decoding report ID: %d, len: %d, interface: 0x%04x", report_id, report_len, interface);
+    // For debugging, log the first few bytes of the report
+    if (len >= 8) {
+        LOG_INF("[Joy-Con 2] Report data: %02x %02x %02x %02x %02x %02x %02x %02x...", 
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+    }
 
     // Create a standard HID report structure for the remapper
     struct report_type decoded_report;
     decoded_report.interface = interface;
-    decoded_report.len = report_len + 1;
-    decoded_report.data[0] = report_id;
+    decoded_report.len = len;
     
-    // Copy the report data
-    if (report_len > 0 && report_len <= sizeof(decoded_report.data) - 1) {
-        memcpy(decoded_report.data + 1, report_data, report_len);
+    // Copy the entire report data as-is
+    if (len <= sizeof(decoded_report.data)) {
+        memcpy(decoded_report.data, data, len);
         
-        // Process the decoded report through the normal remapper pipeline
+        // Process the report through the normal remapper pipeline
         if (k_msgq_put(&report_q, &decoded_report, K_NO_WAIT)) {
-            LOG_ERR("[Joy-Con 2] Failed to queue decoded report");
+            LOG_ERR("[Joy-Con 2] Failed to queue report");
         } else {
-            LOG_INF("[Joy-Con 2] Successfully queued decoded report");
+            LOG_INF("[Joy-Con 2] Successfully queued report (len: %d)", len);
         }
     } else {
-        LOG_ERR("[Joy-Con 2] Invalid report length: %d", report_len);
+        LOG_ERR("[Joy-Con 2] Report too large: %d bytes", len);
     }
 }
 
