@@ -309,6 +309,14 @@ static bool is_joycon2_device(const struct bt_scan_device_info* device_info) {
     return false;
 }
 
+// Add device info storage per connection
+struct device_info_storage {
+    struct bt_scan_device_info* device_info;
+    bool is_joycon2;
+};
+
+static struct device_info_storage device_info_per_conn[CONFIG_BT_MAX_CONN] = {0};
+
 static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt_scan_filter_match* filter_match, bool connectable) {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -323,7 +331,14 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
 
     if (is_joycon2_device(device_info)) {
         LOG_INF("Joy-Con 2 detected at %s", addr);
-        // TODO: Mark for special handling in connection
+        // Store device info for later use in connection
+        for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+            if (device_info_per_conn[i].device_info == NULL) {
+                device_info_per_conn[i].device_info = device_info;
+                device_info_per_conn[i].is_joycon2 = true;
+                break;
+            }
+        }
     }
 }
 
@@ -387,7 +402,26 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
 static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     LOG_INF("");
     patch_broken_uuids(dm);
-    CHK(bt_hogp_handles_assign(dm, ((struct bt_hogp*) context)));  // XXX disconnect if this fails?
+    
+    struct bt_hogp* hogp = (struct bt_hogp*) context;
+    struct bt_conn* conn = bt_hogp_conn(hogp);
+    uint8_t conn_idx = bt_conn_index(conn);
+    
+    // Check if this is a Joy-Con 2 connection
+    if (conn_idx < CONFIG_BT_MAX_CONN && device_info_per_conn[conn_idx].is_joycon2) {
+        LOG_INF("Joy-Con 2 discovery completed, discovering characteristics");
+        discover_joycon2_characteristics(conn, dm);
+        
+        // Enable sensors for Joy-Con 2
+        for (int i = 0; i < joycon2_count; i++) {
+            if (joycon2_conns[i].conn == conn) {
+                enable_joycon2_sensors(conn, joycon2_conns[i].write_handle);
+                break;
+            }
+        }
+    }
+    
+    CHK(bt_hogp_handles_assign(dm, hogp));
     CHK(bt_gatt_dm_data_release(dm));
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
@@ -526,10 +560,38 @@ static int8_t hogp_index(struct bt_hogp* hogp) {
     return -1;
 }
 
-// Add a stub for Joy-Con 2 report decoding
+// Implement Joy-Con 2 report decoding
 static void joycon2_decode_and_handle_report(const uint8_t* data, uint8_t len, uint16_t interface) {
-    // TODO: Implement JoyConDecoder logic here
-    LOG_INF("[Joy-Con 2] Decoding and handling report, len=%d, interface=0x%04x", len, interface);
+    if (len < 2) {
+        LOG_ERR("[Joy-Con 2] Report too short: %d", len);
+        return;
+    }
+
+    uint8_t report_id = data[0];
+    const uint8_t* report_data = data + 1;
+    uint8_t report_len = len - 1;
+
+    LOG_INF("[Joy-Con 2] Decoding report ID: %d, len: %d, interface: 0x%04x", report_id, report_len, interface);
+
+    // Create a standard HID report structure for the remapper
+    struct report_type decoded_report;
+    decoded_report.interface = interface;
+    decoded_report.len = report_len + 1;
+    decoded_report.data[0] = report_id;
+    
+    // Copy the report data
+    if (report_len > 0 && report_len <= sizeof(decoded_report.data) - 1) {
+        memcpy(decoded_report.data + 1, report_data, report_len);
+        
+        // Process the decoded report through the normal remapper pipeline
+        if (k_msgq_put(&report_q, &decoded_report, K_NO_WAIT)) {
+            LOG_ERR("[Joy-Con 2] Failed to queue decoded report");
+        } else {
+            LOG_INF("[Joy-Con 2] Successfully queued decoded report");
+        }
+    } else {
+        LOG_ERR("[Joy-Con 2] Invalid report length: %d", report_len);
+    }
 }
 
 static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
@@ -681,12 +743,14 @@ static void hogp_ready_work_fn(struct k_work* work) {
         LOG_DBG("found bond idx: %d", find_bond.found_idx);
         device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
 
-        // Joy-Con 2 GATT discovery
+        // Joy-Con 2 GATT discovery is now handled in discovery_completed_cb
         struct bt_conn* conn = bt_hogp_conn(item.hogp);
-        if (is_joycon2_device(/* TODO: need to pass device_info or store per-conn */NULL)) {
-            // This is a Joy-Con 2, discover characteristics
-            // NOTE: We need the bt_gatt_dm* from discovery_completed_cb, so this is a placeholder
-            // In real code, call discover_joycon2_characteristics(conn, dm) from discovery_completed_cb
+        uint8_t conn_idx = bt_conn_index(conn);
+        
+        // Clear device info for this connection
+        if (conn_idx < CONFIG_BT_MAX_CONN) {
+            device_info_per_conn[conn_idx].device_info = NULL;
+            device_info_per_conn[conn_idx].is_joycon2 = false;
         }
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
@@ -1013,15 +1077,99 @@ void interval_override_updated() {
 }
 
 void queue_out_report(uint16_t interface, uint8_t report_id, const uint8_t* buffer, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_OUTPUT) {
+            // Send the report
+            int err = bt_hogp_rep_write(hogp, rep, buffer, len);
+            if (err) {
+                LOG_ERR("Failed to send output report: %d", err);
+            } else {
+                LOG_INF("Sent output report ID: %d, len: %d", report_id, len);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No output report found for ID: %d", report_id);
 }
 
 void queue_set_feature_report(uint16_t interface, uint8_t report_id, const uint8_t* buffer, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
+            // Send the feature report
+            int err = bt_hogp_rep_write(hogp, rep, buffer, len);
+            if (err) {
+                LOG_ERR("Failed to send feature report: %d", err);
+            } else {
+                LOG_INF("Sent feature report ID: %d, len: %d", report_id, len);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No feature report found for ID: %d", report_id);
 }
 
 void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
+            // Read the feature report
+            int err = bt_hogp_rep_read(hogp, rep);
+            if (err) {
+                LOG_ERR("Failed to read feature report: %d", err);
+            } else {
+                LOG_INF("Requested feature report ID: %d", report_id);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No feature report found for ID: %d", report_id);
 }
 
 void set_gpio_inout_masks(uint32_t in_mask, uint32_t out_mask) {
