@@ -302,13 +302,9 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
             }
         }
         
-        // Also check for device name in advertisement data
-        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
-        
         // In Zephyr, advertisement data is accessed through net_buf_simple
         // We need to parse the advertisement data to find device name
-        char addr[BT_ADDR_LE_STR_LEN];
-        bt_addr_le_to_str(recv_info->addr, addr, sizeof(addr));
+        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
         
         LOG_INF("Checking device at %s for Joy-Con 2", addr);
         

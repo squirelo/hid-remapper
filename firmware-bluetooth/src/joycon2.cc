@@ -4,6 +4,7 @@
 #include <string.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_REGISTER(joycon2, LOG_LEVEL_DBG);
 
@@ -57,6 +58,12 @@ bool joycon2_is_device(const struct bt_scan_device_info* device_info) {
     // The advertisement data should be accessed through a separate parameter
     // in the scan callback function, not through recv_info->data
     
+    // For debugging purposes, let's assume any device with "Joy-Con" in the name
+    // or Nintendo manufacturer ID is a Joy-Con 2
+    // This is a temporary implementation until we can properly parse advertisement data
+    
+    // For now, return false to avoid false positives
+    // TODO: Implement proper advertisement data parsing
     return false;
 }
 
