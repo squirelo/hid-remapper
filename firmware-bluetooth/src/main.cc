@@ -24,6 +24,7 @@
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "joycon2.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -276,46 +277,6 @@ static void clear_bonds_work_fn(struct k_work* work) {
 }
 static K_WORK_DEFINE(clear_bonds_work, clear_bonds_work_fn);
 
-#define JOYCON2_MANUFACTURER_ID 0x057E
-#define JOYCON2_LEFT_NAME "Joy-Con (L)"
-#define JOYCON2_RIGHT_NAME "Joy-Con (R)"
-
-static bool is_joycon2_device(const struct bt_scan_device_info* device_info) {
-    // Check manufacturer data
-    const struct bt_data* adv = device_info->adv_data;
-    size_t adv_len = device_info->adv_data_len;
-    
-    for (size_t i = 0; i < adv_len; i++) {
-        const struct bt_data* data = &adv[i];
-        
-        if (data->type == BT_DATA_MANUFACTURER_DATA && data->data_len >= 2) {
-            uint16_t company_id = data->data[0] | (data->data[1] << 8);
-            if (company_id == JOYCON2_MANUFACTURER_ID) {
-                return true;
-            }
-        }
-        
-        if (data->type == BT_DATA_NAME_COMPLETE || data->type == BT_DATA_NAME_SHORTENED) {
-            char name[32] = {0};
-            size_t name_len = data->data_len;
-            if (name_len > sizeof(name) - 1) name_len = sizeof(name) - 1;
-            memcpy(name, data->data, name_len);
-            if (strstr(name, JOYCON2_LEFT_NAME) || strstr(name, JOYCON2_RIGHT_NAME)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// Add device info storage per connection
-struct device_info_storage {
-    struct bt_scan_device_info* device_info;
-    bool is_joycon2;
-};
-
-static struct device_info_storage device_info_per_conn[CONFIG_BT_MAX_CONN] = {0};
-
 static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt_scan_filter_match* filter_match, bool connectable) {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -328,13 +289,12 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
 
     LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
 
-    if (is_joycon2_device(device_info)) {
+    if (joycon2_is_device(device_info)) {
         LOG_INF("Joy-Con 2 detected at %s", addr);
         // Store device info for later use in connection
         for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-            if (device_info_per_conn[i].device_info == NULL) {
-                device_info_per_conn[i].device_info = device_info;
-                device_info_per_conn[i].is_joycon2 = true;
+            if (!joycon2_is_connection(i)) {
+                joycon2_store_device_info(device_info, i);
                 break;
             }
         }
@@ -408,16 +368,14 @@ static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     uint8_t conn_idx = bt_conn_index(conn);
     
     // Check if this is a Joy-Con 2 connection
-    if (conn_idx < CONFIG_BT_MAX_CONN && device_info_per_conn[conn_idx].is_joycon2) {
+    if (joycon2_is_connection(conn_idx)) {
         LOG_INF("Joy-Con 2 discovery completed, discovering characteristics");
-        discover_joycon2_characteristics(conn, dm);
+        joycon2_discover_characteristics(conn, dm);
         
         // Enable sensors for Joy-Con 2
-        for (int i = 0; i < joycon2_count; i++) {
-            if (joycon2_conns[i].conn == conn) {
-                enable_joycon2_sensors(conn, joycon2_conns[i].write_handle);
-                break;
-            }
+        struct joycon2_connection* joycon2_conn = joycon2_find_connection(conn);
+        if (joycon2_conn) {
+            joycon2_enable_sensors(conn, joycon2_conn->write_handle);
         }
     }
     
@@ -560,40 +518,6 @@ static int8_t hogp_index(struct bt_hogp* hogp) {
     return -1;
 }
 
-// Implement Joy-Con 2 report decoding
-static void joycon2_decode_and_handle_report(const uint8_t* data, uint8_t len, uint16_t interface) {
-    if (len < 2) {
-        LOG_ERR("[Joy-Con 2] Report too short: %d", len);
-        return;
-    }
-
-    uint8_t report_id = data[0];
-    const uint8_t* report_data = data + 1;
-    uint8_t report_len = len - 1;
-
-    LOG_INF("[Joy-Con 2] Decoding report ID: %d, len: %d, interface: 0x%04x", report_id, report_len, interface);
-
-    // Create a standard HID report structure for the remapper
-    struct report_type decoded_report;
-    decoded_report.interface = interface;
-    decoded_report.len = report_len + 1;
-    decoded_report.data[0] = report_id;
-    
-    // Copy the report data
-    if (report_len > 0 && report_len <= sizeof(decoded_report.data) - 1) {
-        memcpy(decoded_report.data + 1, report_data, report_len);
-        
-        // Process the decoded report through the normal remapper pipeline
-        if (k_msgq_put(&report_q, &decoded_report, K_NO_WAIT)) {
-            LOG_ERR("[Joy-Con 2] Failed to queue decoded report");
-        } else {
-            LOG_INF("[Joy-Con 2] Successfully queued decoded report");
-        }
-    } else {
-        LOG_ERR("[Joy-Con 2] Invalid report length: %d", report_len);
-    }
-}
-
 static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
     k_work_reschedule(&activity_led_off_work, K_MSEC(50));  // XXX what if work_fn is currently running? it might turn the led off after we turn it on
     gpio_pin_set_dt(&led0, true);
@@ -617,14 +541,7 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     memcpy(buf.data + 1, data, buf.len);
 
     // Check if this is a Joy-Con 2 connection
-    bool is_joycon2 = false;
-    for (int i = 0; i < joycon2_count; ++i) {
-        if (joycon2_conns[i].conn == bt_hogp_conn(hogp)) {
-            is_joycon2 = true;
-            break;
-        }
-    }
-    if (is_joycon2) {
+    if (joycon2_is_connection_by_conn(bt_hogp_conn(hogp))) {
         joycon2_decode_and_handle_report(buf.data, buf.len, buf.interface);
     } else {
         if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
@@ -665,68 +582,6 @@ static void find_bond_cb(const struct bt_bond_info* info, void* user_data) {
     }
 }
 
-// Joy-Con 2 GATT UUIDs (from your Windows code)
-static const struct bt_uuid_128 joycon2_input_report_uuid = BT_UUID_INIT_128(0xbe,0xe9,0x7d,0xab,0xfe,0x89,0xad,0x49,0x82,0x8f,0x11,0x8f,0x09,0xdf,0x7f,0xd2);
-static const struct bt_uuid_128 joycon2_write_command_uuid = BT_UUID_INIT_128(0xc9,0x4a,0x9d,0x64,0xb7,0x8e,0x6c,0x4e,0xaf,0x44,0x1e,0xa5,0x4f,0xe5,0xf0,0x05);
-
-struct joycon2_connection {
-    struct bt_conn* conn;
-    uint16_t input_handle;
-    uint16_t write_handle;
-};
-
-#define MAX_JOYCON2 2
-static struct joycon2_connection joycon2_conns[MAX_JOYCON2];
-static int joycon2_count = 0;
-
-static void discover_joycon2_characteristics(struct bt_conn* conn, struct bt_gatt_dm* dm) {
-    const struct bt_gatt_dm_attr* attr = NULL;
-    uint16_t input_handle = 0, write_handle = 0;
-    while ((attr = bt_gatt_dm_attr_next(dm, attr))) {
-        if (bt_uuid_cmp(attr->uuid, &joycon2_input_report_uuid.uuid) == 0) {
-            input_handle = attr->handle;
-        }
-        if (bt_uuid_cmp(attr->uuid, &joycon2_write_command_uuid.uuid) == 0) {
-            write_handle = attr->handle;
-        }
-    }
-    if (input_handle && write_handle && joycon2_count < MAX_JOYCON2) {
-        joycon2_conns[joycon2_count].conn = conn;
-        joycon2_conns[joycon2_count].input_handle = input_handle;
-        joycon2_conns[joycon2_count].write_handle = write_handle;
-        joycon2_count++;
-        LOG_INF("Joy-Con 2 GATT handles: input=0x%04x write=0x%04x", input_handle, write_handle);
-    }
-}
-
-static void enable_joycon2_sensors(struct bt_conn* conn, uint16_t write_handle) {
-    static const uint8_t enable_imu_cmd1[] = { 0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00 };
-    static const uint8_t enable_imu_cmd2[] = { 0x0c, 0x91, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00 };
-    struct bt_gatt_write_params params = {0};
-    int err;
-
-    params.handle = write_handle;
-    params.offset = 0;
-    params.data = enable_imu_cmd1;
-    params.length = sizeof(enable_imu_cmd1);
-    params.func = NULL;
-    err = bt_gatt_write(conn, &params);
-    if (err) {
-        LOG_ERR("Failed to send Joy-Con 2 IMU enable cmd1: %d", err);
-    } else {
-        LOG_INF("Sent Joy-Con 2 IMU enable cmd1");
-    }
-    k_sleep(K_MSEC(100));
-    params.data = enable_imu_cmd2;
-    params.length = sizeof(enable_imu_cmd2);
-    err = bt_gatt_write(conn, &params);
-    if (err) {
-        LOG_ERR("Failed to send Joy-Con 2 IMU enable cmd2: %d", err);
-    } else {
-        LOG_INF("Sent Joy-Con 2 IMU enable cmd2");
-    }
-}
-
 static void hogp_ready_work_fn(struct k_work* work) {
     struct bt_hogp_rep_info* rep = NULL;
     struct hogp_ready_type item;
@@ -748,10 +603,7 @@ static void hogp_ready_work_fn(struct k_work* work) {
         uint8_t conn_idx = bt_conn_index(conn);
         
         // Clear device info for this connection
-        if (conn_idx < CONFIG_BT_MAX_CONN) {
-            device_info_per_conn[conn_idx].device_info = NULL;
-            device_info_per_conn[conn_idx].is_joycon2 = false;
-        }
+        joycon2_cleanup_connection(conn_idx);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
@@ -1077,6 +929,23 @@ uint64_t get_time() {
 void interval_override_updated() {
 }
 
+static void hogp_write_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err) {
+    if (err) {
+        LOG_ERR("HOGP write failed: %d", err);
+    } else {
+        LOG_INF("HOGP write completed successfully");
+    }
+}
+
+static uint8_t hogp_read_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
+    if (err) {
+        LOG_ERR("HOGP read failed: %d", err);
+    } else {
+        LOG_INF("HOGP read completed successfully");
+    }
+    return BT_GATT_ITER_STOP;
+}
+
 void queue_out_report(uint16_t interface, uint8_t report_id, const uint8_t* buffer, uint8_t len) {
     // Find the appropriate HOGP connection for this interface
     uint8_t conn_idx = interface >> 8;
@@ -1096,7 +965,7 @@ void queue_out_report(uint16_t interface, uint8_t report_id, const uint8_t* buff
     while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
         if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_OUTPUT) {
             // Send the report
-            int err = bt_hogp_rep_write(hogp, rep, buffer, len);
+            int err = bt_hogp_rep_write(hogp, rep, hogp_write_cb, buffer, len);
             if (err) {
                 LOG_ERR("Failed to send output report: %d", err);
             } else {
@@ -1128,7 +997,7 @@ void queue_set_feature_report(uint16_t interface, uint8_t report_id, const uint8
     while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
         if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
             // Send the feature report
-            int err = bt_hogp_rep_write(hogp, rep, buffer, len);
+            int err = bt_hogp_rep_write(hogp, rep, hogp_write_cb, buffer, len);
             if (err) {
                 LOG_ERR("Failed to send feature report: %d", err);
             } else {
@@ -1160,7 +1029,7 @@ void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len
     while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
         if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
             // Read the feature report
-            int err = bt_hogp_rep_read(hogp, rep);
+            int err = bt_hogp_rep_read(hogp, rep, hogp_read_cb);
             if (err) {
                 LOG_ERR("Failed to read feature report: %d", err);
             } else {
