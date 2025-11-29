@@ -31,6 +31,24 @@ LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 static bool host_mode_enabled = true;
 static bool peripheral_mode_enabled = true;
 
+static constexpr uint8_t VIRTUAL_PERIPHERAL_DEV_ADDR = 0xFE;
+static constexpr uint16_t VIRTUAL_PERIPHERAL_INTERFACE = (VIRTUAL_PERIPHERAL_DEV_ADDR << 8);
+static bool virtual_peripheral_registered = false;
+
+// Helper function to convert connection index to interface address, avoiding collision with virtual peripheral
+static uint16_t conn_idx_to_interface(uint8_t conn_idx) {
+    uint16_t interface = conn_idx << 8;
+    // Check for collision with virtual peripheral interface (0xFE00)
+    if (interface == VIRTUAL_PERIPHERAL_INTERFACE) {
+        LOG_ERR("Connection index collision detected! conn_idx=%d would create interface 0x%04X (same as virtual peripheral)", 
+                conn_idx, interface);
+        // Use a different interface address to avoid collision
+        // Use 0xFF00 instead (conn_idx 0xFF is invalid, so this is safe)
+        return 0xFF00;
+    }
+    return interface;
+}
+
 // Nordic UART Service UUID 
 static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
@@ -76,8 +94,12 @@ static bool escaped = false;
 static void peripheral_mode_init(void);
 static void process_peripheral_command(uint8_t* buf, int count);
 static void start_peripheral_advertising(void);
+static void advertising_retry_work_fn(struct k_work* work);
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
 static void update_led_status(void);
+static void unregister_virtual_peripheral(void);
+static void handle_peripheral_disconnect(uint8_t reason, bool restart_advertising);
+static bool conn_is_peripheral(struct bt_conn* conn);
 
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
@@ -95,6 +117,8 @@ static const int ACTIVITY_LED_DURATION_MS = 50;   // Activity LED on duration
 static const int RESTART_ADVERTISING_DELAY_MS = 100;  // Delay before restarting advertising
 static const int LED_STATUS_UPDATE_INTERVAL_MS = 5000;  // LED status check interval
 static const int MAIN_LOOP_SLEEP_US = 1;          // Main loop sleep to prevent pairing issues
+static const int ADVERTISING_RETRY_DELAY_MS = 2000;  // Delay before retrying advertising on failure
+static const int ADVERTISING_MAX_RETRIES = 5;  // Maximum number of advertising retry attempts
 
 // these macros don't work in C++ when used directly ("taking address of temporary array")
 static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HIDS_VAL);
@@ -319,6 +343,8 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
     if (peripheral_mode_enabled) {
         peripheral_conn = bt_conn_ref(conn);
         LOG_INF("Peripheral connected");
+        // Reset retry count on successful connection
+        atomic_set(&advertising_retry_count, 0);
         update_led_status();
         
         LOG_INF("Peripheral connection established successfully");
@@ -328,6 +354,8 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
 static void restart_advertising_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(restart_advertising_work, restart_advertising_work_fn);
 
+static atomic_t advertising_retry_count = ATOMIC_INIT(0);
+
 static void restart_advertising_work_fn(struct k_work* work) {
     if (peripheral_mode_enabled && peripheral_conn == NULL) {
         LOG_INF("Restarting peripheral advertising after disconnect");
@@ -335,21 +363,37 @@ static void restart_advertising_work_fn(struct k_work* work) {
     }
 }
 
+static bool conn_is_peripheral(struct bt_conn* conn) {
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) != 0) {
+        return false;
+    }
+    return info.role == BT_CONN_ROLE_PERIPHERAL;
+}
+
+static void handle_peripheral_disconnect(uint8_t reason, bool restart_advertising) {
+    ARG_UNUSED(reason);
+
+    if (peripheral_conn != NULL) {
+        bt_conn_unref(peripheral_conn);
+        peripheral_conn = NULL;
+    }
+
+    bytes_read = 0;
+    escaped = false;
+
+    update_led_status();
+
+    if (restart_advertising && peripheral_mode_enabled) {
+        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
+    }
+}
+
 static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     if (peripheral_mode_enabled && conn == peripheral_conn) {
         LOG_INF("Peripheral disconnected (reason %u)", reason);
-        bt_conn_unref(peripheral_conn);
-        peripheral_conn = NULL;
-        
-        // Reset packet parsing state on disconnect
-        bytes_read = 0;
-        escaped = false;
-        
-        update_led_status();
-        
-        // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
+        handle_peripheral_disconnect(reason, true);
     }
 }
 
@@ -463,11 +507,17 @@ static K_WORK_DELAYABLE_DEFINE(scan_start_work, scan_start_work_fn);
 
 static void scan_stop_work_fn(struct k_work* work) {
     scan_stop();
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    if (host_mode_enabled) {
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
 }
 static K_WORK_DEFINE(scan_stop_work, scan_stop_work_fn);
 
 static void disconnect_conn(struct bt_conn* conn, void* data) {
+    // Don't disconnect peripheral connections when disabling host mode
+    if (peripheral_mode_enabled && conn_is_peripheral(conn)) {
+        return;
+    }
     CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
 }
 
@@ -612,59 +662,12 @@ static void peripheral_mode_init(void) {
     bytes_read = 0;
     escaped = false;
     
-    // Create a virtual transmitter device that represents the input source
-    uint16_t virtual_interface = 0x0000;  // Use proper interface 0x0000
+    unregister_virtual_peripheral();
     
-    
-    // Virtual gamepad descriptor with Report ID to match firmware format expectations
-    static const uint8_t virtual_gamepad_descriptor[] = {
-        0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
-        0x09, 0x05,        // Usage (Game Pad)
-        0xA1, 0x01,        // Collection (Application)
-        0x85, 0x01,        //   Report ID (1) - Add report ID to match firmware format
-        0x15, 0x00,        //   Logical Minimum (0)
-        0x25, 0x01,        //   Logical Maximum (1)
-        0x35, 0x00,        //   Physical Minimum (0)
-        0x45, 0x01,        //   Physical Maximum (1)
-        0x75, 0x01,        //   Report Size (1)
-        0x95, 0x0E,        //   Report Count (14) - 14 buttons like horipad
-        0x05, 0x09,        //   Usage Page (Button)
-        0x19, 0x01,        //   Usage Minimum (0x01)
-        0x29, 0x0E,        //   Usage Maximum (0x0E)
-        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x95, 0x02,        //   Report Count (2) - 2-bit padding like horipad
-        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
-        0x25, 0x0F,        //   Logical Maximum (15) - to match transmitter dpad_lut
-        0x46, 0x3B, 0x01,  //   Physical Maximum (315)
-        0x75, 0x04,        //   Report Size (4)
-        0x95, 0x01,        //   Report Count (1)
-        0x65, 0x14,        //   Unit (System: English Rotation, Length: Centimeter)
-        0x09, 0x39,        //   Usage (Hat switch)
-        0x81, 0x42,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,Null State)
-        0x65, 0x00,        //   Unit (None)
-        0x95, 0x01,        //   Report Count (1) - 4-bit padding
-        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-        0x46, 0xFF, 0x00,  //   Physical Maximum (255)
-        0x09, 0x30,        //   Usage (X)
-        0x09, 0x31,        //   Usage (Y)
-        0x09, 0x32,        //   Usage (Z)
-        0x09, 0x35,        //   Usage (Rz)
-        0x75, 0x08,        //   Report Size (8)
-        0x95, 0x04,        //   Report Count (4)
-        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0x75, 0x08,        //   Report Size (8) - like horipad
-        0x95, 0x01,        //   Report Count (1) - 1 padding byte
-        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
-        0xC0,              // End Collection
-    };
-    
-    parse_descriptor(0x0F0D, 0x00C1,  // Use horipad VID/PID as reference
-                    virtual_gamepad_descriptor, 
-                    sizeof(virtual_gamepad_descriptor), 
-                    virtual_interface, 0);
-    device_connected_callback(virtual_interface, 0x0F0D, 0x00C1, 0);
+    // Initialize with default descriptor (2 = horipad gamepad, matching previous behavior)
+    // The descriptor will be updated when the first packet arrives with a different descriptor number
+    our_descriptor_number = 2;
+    register_virtual_peripheral_with_descriptor(our_descriptor_number);
     
     their_descriptor_updated = true;
     
@@ -675,9 +678,75 @@ static void peripheral_mode_init(void) {
     LOG_INF("Peripheral mode initialized with virtual gamepad descriptor");
 }
 
+static void unregister_virtual_peripheral(void) {
+    if (!virtual_peripheral_registered) {
+        return;
+    }
+    device_disconnected_callback(VIRTUAL_PERIPHERAL_DEV_ADDR);
+    virtual_peripheral_registered = false;
+}
+
+static void register_virtual_peripheral_with_descriptor(uint8_t descriptor_idx) {
+    if (descriptor_idx >= NOUR_DESCRIPTORS) {
+        LOG_ERR("Invalid descriptor index: %d (max %d)", descriptor_idx, NOUR_DESCRIPTORS - 1);
+        return;
+    }
+    
+    // Unregister current virtual peripheral if registered
+    if (virtual_peripheral_registered) {
+        unregister_virtual_peripheral();
+    }
+    
+    // Get descriptor from our_descriptors array
+    const our_descriptor_def_t* desc = &our_descriptors[descriptor_idx];
+    
+    // Get VID/PID from descriptor, or use defaults
+    uint16_t vid = (desc->vid != 0) ? desc->vid : 0x0F0D;
+    uint16_t pid = (desc->pid != 0) ? desc->pid : 0x00C1;
+    
+    // Parse the descriptor
+    parse_descriptor(vid, pid,
+                    desc->descriptor,
+                    desc->descriptor_length,
+                    VIRTUAL_PERIPHERAL_INTERFACE, 0);
+    
+    // Notify that device is connected
+    device_connected_callback(VIRTUAL_PERIPHERAL_INTERFACE, vid, pid, 0);
+    virtual_peripheral_registered = true;
+    
+    LOG_INF("Virtual peripheral registered with descriptor %d (VID: 0x%04X, PID: 0x%04X)", 
+            descriptor_idx, vid, pid);
+}
+
+static K_WORK_DELAYABLE_DEFINE(advertising_retry_work, advertising_retry_work_fn);
+
+static void advertising_retry_work_fn(struct k_work* work) {
+    if (!peripheral_mode_enabled) {
+        atomic_set(&advertising_retry_count, 0);
+        return;
+    }
+    
+    if (peripheral_conn != NULL) {
+        // Already connected, no need to retry
+        atomic_set(&advertising_retry_count, 0);
+        return;
+    }
+    
+    int retry_count = atomic_get(&advertising_retry_count);
+    if (retry_count >= ADVERTISING_MAX_RETRIES) {
+        LOG_ERR("Advertising failed after %d retries, giving up", ADVERTISING_MAX_RETRIES);
+        atomic_set(&advertising_retry_count, 0);
+        return;
+    }
+    
+    LOG_INF("Retrying peripheral advertising (attempt %d/%d)", retry_count + 1, ADVERTISING_MAX_RETRIES);
+    start_peripheral_advertising();
+}
+
 static void start_peripheral_advertising(void) {
     if (!peripheral_mode_enabled) {
         LOG_DBG("Peripheral mode disabled, skipping advertising");
+        atomic_set(&advertising_retry_count, 0);
         return;
     }
     
@@ -706,50 +775,96 @@ static void start_peripheral_advertising(void) {
     int result = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0);
     if (result == 0) {
         LOG_INF("Peripheral advertising started as 'HID Remapper'");
+        atomic_set(&advertising_retry_count, 0);  // Reset retry count on success
     } else {
         LOG_ERR("Failed to start peripheral advertising, error: %d", result);
         if (result == -EALREADY) {
             LOG_WRN("Advertising already running");
+            atomic_set(&advertising_retry_count, 0);  // Not a real failure
+        } else {
+            // Schedule retry
+            int retry_count = atomic_inc(&advertising_retry_count);
+            if (retry_count < ADVERTISING_MAX_RETRIES) {
+                LOG_INF("Scheduling advertising retry in %d ms", ADVERTISING_RETRY_DELAY_MS);
+                k_work_reschedule(&advertising_retry_work, K_MSEC(ADVERTISING_RETRY_DELAY_MS));
+            } else {
+                LOG_ERR("Advertising failed, max retries reached");
+                atomic_set(&advertising_retry_count, 0);
+            }
         }
     }
 }
 
 static void handle_received_packet(const uint8_t* data, uint16_t len) {
-    if (len < sizeof(packet_t)) {
-        LOG_WRN("Packet too small: %d < %d", len, sizeof(packet_t));
+    // TypeScript protocol format: [protocol_version, command, payload_length, descriptor_number, ...payload...]
+    // Minimum packet size: 4 bytes header
+    if (len < 4) {
+        LOG_WRN("Packet too small: %d < 4", len);
         return;
     }
     
-    packet_t* msg = (packet_t*) data;
-    uint16_t payload_len = len - sizeof(packet_t);
+    // Parse header bytes
+    uint8_t protocol_version = data[0];
+    uint8_t command = data[1];
+    uint8_t payload_length = data[2];
+    uint8_t descriptor_number = data[3];
     
-    LOG_DBG("Packet validation: proto=%d (expect %d), len=%d, payload=%d, desc=%d, report_id=%d", 
-            msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
-            msg->our_descriptor_number, msg->report_id);
+    // Calculate actual payload length (total length minus 4-byte header)
+    uint16_t actual_payload_len = len - 4;
     
-    if ((msg->protocol_version != PROTOCOL_VERSION) ||
-        (msg->len != payload_len) ||
-        (payload_len > 64) ||
-        (msg->our_descriptor_number >= NOUR_DESCRIPTORS) ||
-        ((msg->report_id == 0) && (payload_len >= 64))) {
-        LOG_WRN("Invalid packet: proto=%d (expect %d), len=%d vs %d, desc=%d (max %d), report_id=%d", 
-                msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
-                msg->our_descriptor_number, NOUR_DESCRIPTORS, msg->report_id);
+    LOG_DBG("Packet validation: proto=%d (expect %d), cmd=%d, len=%d, payload=%d, desc=%d", 
+            protocol_version, PROTOCOL_VERSION, command, payload_length, actual_payload_len, 
+            descriptor_number);
+    
+    // Validate protocol version
+    if (protocol_version != PROTOCOL_VERSION) {
+        LOG_WRN("Invalid protocol version: %d (expect %d)", protocol_version, PROTOCOL_VERSION);
         return;
     }
     
-    if (msg->our_descriptor_number != our_descriptor_number) {
-        our_descriptor_number = msg->our_descriptor_number;
-        
+    // Validate command (7 = gamepad report)
+    if (command != 7) {
+        LOG_WRN("Invalid command: %d (expect 7 for gamepad report)", command);
+        return;
+    }
+    
+    // Validate payload length matches
+    if (payload_length != actual_payload_len) {
+        LOG_WRN("Payload length mismatch: header says %d, actual %d", payload_length, actual_payload_len);
+        return;
+    }
+    
+    // Validate payload length is reasonable
+    if (actual_payload_len > 64) {
+        LOG_WRN("Payload too large: %d (max 64)", actual_payload_len);
+        return;
+    }
+    
+    // Validate descriptor number (0-5)
+    if (descriptor_number >= NOUR_DESCRIPTORS) {
+        LOG_WRN("Invalid descriptor number: %d (max %d)", descriptor_number, NOUR_DESCRIPTORS - 1);
+        return;
+    }
+    
+    // Check if descriptor number changed and re-register virtual peripheral if needed
+    if (descriptor_number != our_descriptor_number) {
+        our_descriptor_number = descriptor_number;
         config_updated = true;
         
         LOG_INF("Descriptor number changed to %d", our_descriptor_number);
+        
+        // Re-register virtual peripheral with new descriptor
+        register_virtual_peripheral_with_descriptor(our_descriptor_number);
     }
     
-    handle_received_report(msg->data, len, 0x0000, msg->report_id);
+    // Extract payload (skip 4-byte header)
+    const uint8_t* payload = data + 4;
     
-    LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
-            msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
+    // Process HID report with report_id = 1 (gamepad reports always use report ID 1)
+    handle_received_report(payload, actual_payload_len, VIRTUAL_PERIPHERAL_INTERFACE, 1);
+    
+    LOG_DBG("Packet processed: proto=%d, cmd=%d, desc=%d, report_id=1, payload_len=%d", 
+            protocol_version, command, descriptor_number, actual_payload_len);
 }
 
 static void process_byte_with_framing(uint8_t c) {
@@ -824,6 +939,11 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
     
     if (info.role == BT_CONN_ROLE_PERIPHERAL) {
         LOG_INF("Incoming peripheral connection: %s", addr);
+        // Ensure peripheral_conn is set (in case peripheral_connected callback wasn't called first)
+        if (peripheral_mode_enabled && peripheral_conn == NULL) {
+            peripheral_conn = bt_conn_ref(conn);
+            update_led_status();
+        }
         // Don't force security for incoming connections - let client decide
         return;
     }
@@ -846,19 +966,12 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     LOG_INF("Disconnected: %s (reason=%u)", addr, reason);
 
+    bool is_peripheral = peripheral_mode_enabled && conn_is_peripheral(conn);
+
     // Handle peripheral mode disconnection (in case peripheral_disconnected wasn't called)
-    if (peripheral_mode_enabled && conn == peripheral_conn) {
+    if (is_peripheral) {
         LOG_INF("Peripheral connection cleanup in generic disconnect handler");
-        bt_conn_unref(peripheral_conn);
-        peripheral_conn = NULL;
-        
-        // Reset packet parsing state on disconnect
-        bytes_read = 0;
-        escaped = false;
-        
-        // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
-        update_led_status();
+        handle_peripheral_disconnect(reason, true);
         return; // Don't process as host connection
     }
 
@@ -970,11 +1083,17 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
         k_work_submit(&scan_stop_work);
     } else if (host_mode_enabled) {
+        // Only reschedule if host mode is still enabled
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 
     static struct report_type buf;
-    buf.interface = hogp_index(hogp) << 8;
+    int8_t hogp_idx = hogp_index(hogp);
+    if (hogp_idx < 0) {
+        LOG_ERR("Invalid hogp index, dropping report");
+        return BT_GATT_ITER_STOP;
+    }
+    buf.interface = conn_idx_to_interface((uint8_t)hogp_idx);
     buf.len = bt_hogp_rep_size(rep) + 1;
     buf.data[0] = bt_hogp_rep_id(rep);
 
@@ -1028,7 +1147,8 @@ static void hogp_ready_work_fn(struct k_work* work) {
         bt_addr_le_copy(&find_bond.addr, bt_conn_get_dst(bt_hogp_conn(item.hogp)));
         bt_foreach_bond(BT_ID_DEFAULT, find_bond_cb, &find_bond);
         LOG_DBG("found bond idx: %d", find_bond.found_idx);
-        device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
+        uint8_t conn_idx = bt_conn_index(bt_hogp_conn(item.hogp));
+        device_connected_callback(conn_idx_to_interface(conn_idx), 1, 1, find_bond.found_idx);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
@@ -1350,10 +1470,19 @@ void disable_host_mode() {
     if (host_mode_enabled) {
         host_mode_enabled = false;
         LOG_INF("Host mode disabled");
+        
+        // Cancel pending scan work items
+        k_work_cancel_delayable(&scan_start_work);
+        k_work_cancel(&scan_stop_work);
+        
         if (scanning) {
             scan_stop();
         }
+        
+        // Disconnect only host mode connections (not peripheral connections)
         bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
+        
+        update_led_status();
     }
 }
 
@@ -1369,10 +1498,20 @@ void disable_peripheral_mode() {
     if (peripheral_mode_enabled) {
         peripheral_mode_enabled = false;
         LOG_INF("Peripheral mode disabled");
+        
+        // Cancel pending advertising restart and retry work
+        k_work_cancel_delayable(&restart_advertising_work);
+        k_work_cancel_delayable(&advertising_retry_work);
+        atomic_set(&advertising_retry_count, 0);
+        
         CHK(bt_le_adv_stop());
         if (peripheral_conn) {
             CHK(bt_conn_disconnect(peripheral_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
+            handle_peripheral_disconnect(BT_HCI_ERR_REMOTE_USER_TERM_CONN, false);
         }
+        unregister_virtual_peripheral();
+        
+        update_led_status();
     }
 }
 
@@ -1462,7 +1601,8 @@ int main() {
 
             while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
                 LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
-                parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
+                uint16_t interface = conn_idx_to_interface(incoming_descriptor.conn_idx);
+                parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, interface, 0);
             }
 
             if (their_descriptor_updated) {
@@ -1504,16 +1644,6 @@ int main() {
                 memcpy(get_report_buf, get_report_tmp_buf, sizeof(get_report_buf));
                 k_mutex_unlock(&get_report_mutex);
             }
-        }
-
-        while (!k_msgq_get(&disconnected_q, &disconnected_item, K_NO_WAIT)) {
-            LOG_INF("device_disconnected_callback conn_idx=%d", disconnected_item.conn_idx);
-            device_disconnected_callback(disconnected_item.conn_idx);
-        }
-
-        while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
-            LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
-            parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
         }
 
         if (resume_pending) {
