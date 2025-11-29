@@ -23,6 +23,7 @@
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "nus_service.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -419,6 +420,9 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     LOG_INF("%s (reason=%u)", addr, reason);
 
+    // Handle NUS disconnection
+    nus_handle_disconnected(conn);
+
     uint8_t conn_idx = bt_conn_index(conn);
 
     if (bt_hogp_assign_check(&hogps[conn_idx])) {
@@ -805,6 +809,11 @@ static void bt_init() {
     }
 
     CHK(bt_enable(NULL));
+
+    // Initialize NUS service for peripheral mode
+    if (!CHK(nus_service_init())) {
+        LOG_ERR("Failed to initialize NUS service");
+    }
 }
 
 static int remapper_settings_set(const char* name, size_t len, settings_read_cb read_cb, void* cb_arg) {
