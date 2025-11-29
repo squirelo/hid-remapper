@@ -31,6 +31,10 @@ LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 static bool host_mode_enabled = true;
 static bool peripheral_mode_enabled = true;
 
+static constexpr uint8_t VIRTUAL_PERIPHERAL_DEV_ADDR = 0xFE;
+static constexpr uint16_t VIRTUAL_PERIPHERAL_INTERFACE = (VIRTUAL_PERIPHERAL_DEV_ADDR << 8);
+static bool virtual_peripheral_registered = false;
+
 // Nordic UART Service UUID 
 static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
@@ -78,6 +82,9 @@ static void process_peripheral_command(uint8_t* buf, int count);
 static void start_peripheral_advertising(void);
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
 static void update_led_status(void);
+static void unregister_virtual_peripheral(void);
+static void handle_peripheral_disconnect(uint8_t reason, bool restart_advertising);
+static bool conn_is_peripheral(struct bt_conn* conn);
 
 static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
@@ -335,21 +342,37 @@ static void restart_advertising_work_fn(struct k_work* work) {
     }
 }
 
+static bool conn_is_peripheral(struct bt_conn* conn) {
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) != 0) {
+        return false;
+    }
+    return info.role == BT_CONN_ROLE_PERIPHERAL;
+}
+
+static void handle_peripheral_disconnect(uint8_t reason, bool restart_advertising) {
+    ARG_UNUSED(reason);
+
+    if (peripheral_conn != NULL) {
+        bt_conn_unref(peripheral_conn);
+        peripheral_conn = NULL;
+    }
+
+    bytes_read = 0;
+    escaped = false;
+
+    update_led_status();
+
+    if (restart_advertising && peripheral_mode_enabled) {
+        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
+    }
+}
+
 static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     if (peripheral_mode_enabled && conn == peripheral_conn) {
         LOG_INF("Peripheral disconnected (reason %u)", reason);
-        bt_conn_unref(peripheral_conn);
-        peripheral_conn = NULL;
-        
-        // Reset packet parsing state on disconnect
-        bytes_read = 0;
-        escaped = false;
-        
-        update_led_status();
-        
-        // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
+        handle_peripheral_disconnect(reason, true);
     }
 }
 
@@ -612,9 +635,7 @@ static void peripheral_mode_init(void) {
     bytes_read = 0;
     escaped = false;
     
-    // Create a virtual transmitter device that represents the input source
-    uint16_t virtual_interface = 0x0000;  // Use proper interface 0x0000
-    
+    unregister_virtual_peripheral();
     
     // Virtual gamepad descriptor with Report ID to match firmware format expectations
     static const uint8_t virtual_gamepad_descriptor[] = {
@@ -660,11 +681,12 @@ static void peripheral_mode_init(void) {
         0xC0,              // End Collection
     };
     
-    parse_descriptor(0x0F0D, 0x00C1,  // Use horipad VID/PID as reference
-                    virtual_gamepad_descriptor, 
-                    sizeof(virtual_gamepad_descriptor), 
-                    virtual_interface, 0);
-    device_connected_callback(virtual_interface, 0x0F0D, 0x00C1, 0);
+    parse_descriptor(0x0F0D, 0x00C1,
+                    virtual_gamepad_descriptor,
+                    sizeof(virtual_gamepad_descriptor),
+                    VIRTUAL_PERIPHERAL_INTERFACE, 0);
+    device_connected_callback(VIRTUAL_PERIPHERAL_INTERFACE, 0x0F0D, 0x00C1, 0);
+    virtual_peripheral_registered = true;
     
     their_descriptor_updated = true;
     
@@ -673,6 +695,14 @@ static void peripheral_mode_init(void) {
     }
     
     LOG_INF("Peripheral mode initialized with virtual gamepad descriptor");
+}
+
+static void unregister_virtual_peripheral(void) {
+    if (!virtual_peripheral_registered) {
+        return;
+    }
+    device_disconnected_callback(VIRTUAL_PERIPHERAL_DEV_ADDR);
+    virtual_peripheral_registered = false;
 }
 
 static void start_peripheral_advertising(void) {
@@ -746,7 +776,7 @@ static void handle_received_packet(const uint8_t* data, uint16_t len) {
         LOG_INF("Descriptor number changed to %d", our_descriptor_number);
     }
     
-    handle_received_report(msg->data, len, 0x0000, msg->report_id);
+    handle_received_report(msg->data, payload_len, VIRTUAL_PERIPHERAL_INTERFACE, msg->report_id);
     
     LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
             msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
@@ -846,19 +876,12 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     LOG_INF("Disconnected: %s (reason=%u)", addr, reason);
 
+    bool is_peripheral = peripheral_mode_enabled && conn_is_peripheral(conn);
+
     // Handle peripheral mode disconnection (in case peripheral_disconnected wasn't called)
-    if (peripheral_mode_enabled && conn == peripheral_conn) {
+    if (is_peripheral) {
         LOG_INF("Peripheral connection cleanup in generic disconnect handler");
-        bt_conn_unref(peripheral_conn);
-        peripheral_conn = NULL;
-        
-        // Reset packet parsing state on disconnect
-        bytes_read = 0;
-        escaped = false;
-        
-        // Delay before restarting advertising to ensure connection cleanup
-        k_work_reschedule(&restart_advertising_work, K_MSEC(RESTART_ADVERTISING_DELAY_MS));
-        update_led_status();
+        handle_peripheral_disconnect(reason, true);
         return; // Don't process as host connection
     }
 
@@ -1372,7 +1395,9 @@ void disable_peripheral_mode() {
         CHK(bt_le_adv_stop());
         if (peripheral_conn) {
             CHK(bt_conn_disconnect(peripheral_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
+            handle_peripheral_disconnect(BT_HCI_ERR_REMOTE_USER_TERM_CONN, false);
         }
+        unregister_virtual_peripheral();
     }
 }
 
