@@ -98,6 +98,7 @@ static void advertising_retry_work_fn(struct k_work* work);
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
 static void update_led_status(void);
 static void unregister_virtual_peripheral(void);
+static void register_virtual_peripheral_with_descriptor(uint8_t descriptor_idx);
 static void handle_peripheral_disconnect(uint8_t reason, bool restart_advertising);
 static bool conn_is_peripheral(struct bt_conn* conn);
 
@@ -333,6 +334,8 @@ static void uart_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value
     LOG_DBG("UART CCC changed: %d", value);
 }
 
+static atomic_t advertising_retry_count = ATOMIC_INIT(0);
+
 static void peripheral_connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
@@ -353,8 +356,6 @@ static void peripheral_connected(struct bt_conn *conn, uint8_t err)
 
 static void restart_advertising_work_fn(struct k_work* work);
 static K_WORK_DELAYABLE_DEFINE(restart_advertising_work, restart_advertising_work_fn);
-
-static atomic_t advertising_retry_count = ATOMIC_INIT(0);
 
 static void restart_advertising_work_fn(struct k_work* work) {
     if (peripheral_mode_enabled && peripheral_conn == NULL) {
