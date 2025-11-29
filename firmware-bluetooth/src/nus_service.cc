@@ -119,6 +119,16 @@ static const struct bt_data sd[] = {
     BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
 
+// BT_LE_ADV_CONN macro doesn't work in C++ when used directly ("taking address of temporary array")
+// Manually initialize with same values as BT_LE_ADV_CONN
+static const struct bt_le_adv_param adv_param = {
+    .id = BT_ID_DEFAULT,
+    .options = BT_LE_ADV_OPT_CONNECTABLE,
+    .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+    .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+    .peer = NULL,
+};
+
 // Initialize NUS service and start advertising
 int nus_service_init() {
     int err;
@@ -133,7 +143,7 @@ int nus_service_init() {
     LOG_INF("NUS service initialized");
     
     // Start advertising
-    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Failed to start advertising (err: %d)", err);
         return err;

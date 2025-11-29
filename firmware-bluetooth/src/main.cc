@@ -337,7 +337,7 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
                 bt_uuid_to_str(attr->uuid, str1, sizeof(str2));
                 *((bt_uuid_16*) attr->uuid) = {
                     .uuid = { BT_UUID_TYPE_16 },
-                    .val = (BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
+                    .val = static_cast<uint16_t>(BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
                 };
                 bt_uuid_to_str(attr->uuid, str2, sizeof(str2));
                 LOG_INF("%s -> %s", str1, str2);
@@ -722,6 +722,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;
 }
 
 static void button_init() {
