@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
 
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
@@ -23,6 +24,7 @@
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "joycon2.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -286,6 +288,30 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
     bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
 
     LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
+
+    // Check if this is a Joy-Con 2 device
+    if (joycon2_is_device(device_info)) {
+        LOG_INF("Joy-Con 2 detected at %s", addr);
+        
+        // Store device info for later use in connection
+        for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+            if (!joycon2_is_connection(i)) {
+                joycon2_store_device_info(device_info, i);
+                LOG_INF("Joy-Con 2 device info stored for connection %d", i);
+                break;
+            }
+        }
+        
+        // In Zephyr, advertisement data is accessed through net_buf_simple
+        // We need to parse the advertisement data to find device name
+        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
+        
+        LOG_INF("Checking device at %s for Joy-Con 2", addr);
+        
+        // TODO: Implement proper advertisement data parsing using net_buf_simple
+        // The advertisement data should be accessed through a separate parameter
+        // in the scan callback function, not through recv_info->data
+    }
 }
 
 static void scan_connecting_error(struct bt_scan_device_info* device_info) {
@@ -334,9 +360,10 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
             }
             if (needs_fix) {
                 bt_uuid_to_str(attr->uuid, str1, sizeof(str2));
+                uint16_t uuid_val = (BT_UUID_128(attr->uuid)->val[13] << 8) | BT_UUID_128(attr->uuid)->val[12];
                 *((bt_uuid_16*) attr->uuid) = {
                     .uuid = { BT_UUID_TYPE_16 },
-                    .val = (BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
+                    .val = uuid_val
                 };
                 bt_uuid_to_str(attr->uuid, str2, sizeof(str2));
                 LOG_INF("%s -> %s", str1, str2);
@@ -346,9 +373,31 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
 }
 
 static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
-    LOG_INF("");
+    LOG_INF("GATT discovery completed");
     patch_broken_uuids(dm);
-    CHK(bt_hogp_handles_assign(dm, ((struct bt_hogp*) context)));  // XXX disconnect if this fails?
+    
+    struct bt_hogp* hogp = (struct bt_hogp*) context;
+    struct bt_conn* conn = bt_hogp_conn(hogp);
+    uint8_t conn_idx = bt_conn_index(conn);
+    
+    // Check if this is a Joy-Con 2 connection
+    if (joycon2_is_connection(conn_idx)) {
+        LOG_INF("Joy-Con 2 discovery completed, discovering characteristics");
+        joycon2_discover_characteristics(conn, dm);
+        
+        // Enable sensors for Joy-Con 2
+        struct joycon2_connection* joycon2_conn = joycon2_find_connection(conn);
+        if (joycon2_conn && joycon2_conn->write_handle != 0) {
+            LOG_INF("Enabling Joy-Con 2 sensors on write handle: 0x%04x", joycon2_conn->write_handle);
+            joycon2_enable_sensors(conn, joycon2_conn->write_handle);
+        } else {
+            LOG_WRN("Joy-Con 2 write handle not found, cannot enable sensors");
+        }
+    } else {
+        LOG_INF("Standard HID device discovery completed");
+    }
+    
+    CHK(bt_hogp_handles_assign(dm, hogp));
     CHK(bt_gatt_dm_data_release(dm));
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
@@ -508,8 +557,14 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     buf.data[0] = bt_hogp_rep_id(rep);
 
     memcpy(buf.data + 1, data, buf.len);
-    if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
-        //        printk("error in k_msg_put(report_q\n");
+
+    // Check if this is a Joy-Con 2 connection
+    if (joycon2_is_connection_by_conn(bt_hogp_conn(hogp))) {
+        joycon2_decode_and_handle_report(buf.data, buf.len, buf.interface);
+    } else {
+        if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
+            //        printk("error in k_msg_put(report_q\n");
+        }
     }
 
     return BT_GATT_ITER_CONTINUE;
@@ -560,6 +615,13 @@ static void hogp_ready_work_fn(struct k_work* work) {
         bt_foreach_bond(BT_ID_DEFAULT, find_bond_cb, &find_bond);
         LOG_DBG("found bond idx: %d", find_bond.found_idx);
         device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
+
+        // Joy-Con 2 GATT discovery is now handled in discovery_completed_cb
+        struct bt_conn* conn = bt_hogp_conn(item.hogp);
+        uint8_t conn_idx = bt_conn_index(conn);
+        
+        // Clear device info for this connection
+        joycon2_cleanup_connection(conn_idx);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
@@ -718,6 +780,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;
 }
 
 static void button_init() {
@@ -884,16 +947,117 @@ uint64_t get_time() {
 void interval_override_updated() {
 }
 
+static void hogp_write_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err) {
+    if (err) {
+        LOG_ERR("HOGP write failed: %d", err);
+    } else {
+        LOG_INF("HOGP write completed successfully");
+    }
+}
+
+static uint8_t hogp_read_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep, uint8_t err, const uint8_t* data) {
+    if (err) {
+        LOG_ERR("HOGP read failed: %d", err);
+    } else {
+        LOG_INF("HOGP read completed successfully");
+    }
+    return BT_GATT_ITER_STOP;
+}
+
 void queue_out_report(uint16_t interface, uint8_t report_id, const uint8_t* buffer, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_OUTPUT) {
+            // Send the report
+            int err = bt_hogp_rep_write(hogp, rep, hogp_write_cb, buffer, len);
+            if (err) {
+                LOG_ERR("Failed to send output report: %d", err);
+            } else {
+                LOG_INF("Sent output report ID: %d, len: %d", report_id, len);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No output report found for ID: %d", report_id);
 }
 
 void queue_set_feature_report(uint16_t interface, uint8_t report_id, const uint8_t* buffer, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
+            // Send the feature report
+            int err = bt_hogp_rep_write(hogp, rep, hogp_write_cb, buffer, len);
+            if (err) {
+                LOG_ERR("Failed to send feature report: %d", err);
+            } else {
+                LOG_INF("Sent feature report ID: %d, len: %d", report_id, len);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No feature report found for ID: %d", report_id);
 }
 
 void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len) {
-    // TODO
+    // Find the appropriate HOGP connection for this interface
+    uint8_t conn_idx = interface >> 8;
+    if (conn_idx >= CONFIG_BT_MAX_CONN) {
+        LOG_ERR("Invalid connection index: %d", conn_idx);
+        return;
+    }
+    
+    struct bt_hogp* hogp = &hogps[conn_idx];
+    if (!bt_hogp_assign_check(hogp)) {
+        LOG_ERR("HOGP not assigned for connection %d", conn_idx);
+        return;
+    }
+    
+    // Find the appropriate report info
+    struct bt_hogp_rep_info* rep = NULL;
+    while (NULL != (rep = bt_hogp_rep_next(hogp, rep))) {
+        if (bt_hogp_rep_id(rep) == report_id && bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_FEATURE) {
+            // Read the feature report
+            int err = bt_hogp_rep_read(hogp, rep, hogp_read_cb);
+            if (err) {
+                LOG_ERR("Failed to read feature report: %d", err);
+            } else {
+                LOG_INF("Requested feature report ID: %d", report_id);
+            }
+            return;
+        }
+    }
+    
+    LOG_ERR("No feature report found for ID: %d", report_id);
 }
 
 void set_gpio_inout_masks(uint32_t in_mask, uint32_t out_mask) {
