@@ -208,11 +208,22 @@ static int count_connections() {
     return conn_count;
 }
 
+// Nintendo manufacturer data (0x057E little-endian) for Joy-Con 2 scan filter
+static uint8_t joycon2_manufacturer_data[] = {0x7E, 0x05};
+
 static bool scan_setup_filters() {
     bt_scan_filter_remove_all();
 
     if (!CHK(bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, (struct bt_uuid*) &BT_UUID_HIDS_))) {
         return false;
+    }
+    // Also match Nintendo manufacturer ID for Joy-Con 2
+    struct bt_scan_manufacturer_data mfr_data = {
+        .data = joycon2_manufacturer_data,
+        .data_len = sizeof(joycon2_manufacturer_data),
+    };
+    if (!CHK(bt_scan_filter_add(BT_SCAN_FILTER_TYPE_MANUFACTURER_DATA, &mfr_data))) {
+        LOG_WRN("Joy-Con 2 manufacturer filter failed, HID-only scan");
     }
 
     int bonded_count = 0;
@@ -220,7 +231,7 @@ static bool scan_setup_filters() {
 
     int conn_count = count_connections();
 
-    uint8_t filter_mode = BT_SCAN_UUID_FILTER;
+    uint8_t filter_mode = BT_SCAN_UUID_FILTER | BT_SCAN_MANUFACTURER_DATA_FILTER;
 
     if (peers_only && (bonded_count > 0)) {
         if (conn_count == bonded_count) {
@@ -280,8 +291,11 @@ static K_WORK_DEFINE(clear_bonds_work, clear_bonds_work_fn);
 static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt_scan_filter_match* filter_match, bool connectable) {
     char addr[BT_ADDR_LE_STR_LEN];
 
-    if (!filter_match->uuid.match || (filter_match->uuid.count != 1)) {
-        LOG_WRN("%s invalid device connected", __func__);
+    // Accept match on UUID (HID) OR manufacturer (Joy-Con 2)
+    bool uuid_match = filter_match->uuid.match && filter_match->uuid.count == 1;
+    bool mfr_match = filter_match->manufacturer_data.match;
+    if (!uuid_match && !mfr_match) {
+        LOG_WRN("%s invalid device - no filter match", __func__);
         return;
     }
 
@@ -289,28 +303,9 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
 
     LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
 
-    // Check if this is a Joy-Con 2 device
+    // Check if this is a Joy-Con 2 device (detection only - storage done in scan_connecting)
     if (joycon2_is_device(device_info)) {
         LOG_INF("Joy-Con 2 detected at %s", addr);
-        
-        // Store device info for later use in connection
-        for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-            if (!joycon2_is_connection(i)) {
-                joycon2_store_device_info(device_info, i);
-                LOG_INF("Joy-Con 2 device info stored for connection %d", i);
-                break;
-            }
-        }
-        
-        // In Zephyr, advertisement data is accessed through net_buf_simple
-        // We need to parse the advertisement data to find device name
-        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
-        
-        LOG_INF("Checking device at %s for Joy-Con 2", addr);
-        
-        // TODO: Implement proper advertisement data parsing using net_buf_simple
-        // The advertisement data should be accessed through a separate parameter
-        // in the scan callback function, not through recv_info->data
     }
 }
 
@@ -319,7 +314,12 @@ static void scan_connecting_error(struct bt_scan_device_info* device_info) {
 }
 
 static void scan_connecting(struct bt_scan_device_info* device_info, struct bt_conn* conn) {
-    LOG_INF("");
+    // Store Joy-Con 2 flag at connection time - we have both device_info and conn_idx here
+    if (joycon2_is_device(device_info)) {
+        uint8_t conn_idx = bt_conn_index(conn);
+        joycon2_store_device_info(device_info, conn_idx);
+        LOG_INF("Joy-Con 2 flagged for connection index %d", conn_idx);
+    }
 }
 
 // XXX this hasn't been tested in practice
@@ -375,28 +375,9 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
 static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     LOG_INF("GATT discovery completed");
     patch_broken_uuids(dm);
-    
+    // Note: Joy-Con 2 uses joycon2_gatt_discover, not HIDS discovery - never reaches here
     struct bt_hogp* hogp = (struct bt_hogp*) context;
     struct bt_conn* conn = bt_hogp_conn(hogp);
-    uint8_t conn_idx = bt_conn_index(conn);
-    
-    // Check if this is a Joy-Con 2 connection
-    if (joycon2_is_connection(conn_idx)) {
-        LOG_INF("Joy-Con 2 discovery completed, discovering characteristics");
-        joycon2_discover_characteristics(conn, dm);
-        
-        // Enable sensors for Joy-Con 2
-        struct joycon2_connection* joycon2_conn = joycon2_find_connection(conn);
-        if (joycon2_conn && joycon2_conn->write_handle != 0) {
-            LOG_INF("Enabling Joy-Con 2 sensors on write handle: 0x%04x", joycon2_conn->write_handle);
-            joycon2_enable_sensors(conn, joycon2_conn->write_handle);
-        } else {
-            LOG_WRN("Joy-Con 2 write handle not found, cannot enable sensors");
-        }
-    } else {
-        LOG_INF("Standard HID device discovery completed");
-    }
-    
     CHK(bt_hogp_handles_assign(dm, hogp));
     CHK(bt_gatt_dm_data_release(dm));
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
@@ -417,6 +398,10 @@ static const struct bt_gatt_dm_cb discovery_cb = {
     .service_not_found = discovery_service_not_found_cb,
     .error_found = discovery_error_found_cb,
 };
+
+void joycon2_notify_scan_restart(void) {
+    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+}
 
 static void gatt_discover(struct bt_conn* conn) {
     uint8_t conn_idx = bt_conn_index(conn);
@@ -473,6 +458,7 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     if (bt_hogp_assign_check(&hogps[conn_idx])) {
         bt_hogp_release(&hogps[conn_idx]);
     }
+    joycon2_cleanup_connection(conn_idx);
 
     struct disconnected_type disconnected_item = { .conn_idx = conn_idx };
     CHK(k_msgq_put(&disconnected_q, &disconnected_item, K_NO_WAIT));
@@ -490,7 +476,12 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
         peers_only = true;
-        gatt_discover(conn);
+        uint8_t conn_idx = bt_conn_index(conn);
+        if (joycon2_is_connection(conn_idx)) {
+            joycon2_gatt_discover(conn);
+        } else {
+            gatt_discover(conn);
+        }
     } else {
         LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
     }
@@ -557,16 +548,10 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     buf.data[0] = bt_hogp_rep_id(rep);
 
     memcpy(buf.data + 1, data, buf.len);
-
-    // Check if this is a Joy-Con 2 connection
-    if (joycon2_is_connection_by_conn(bt_hogp_conn(hogp))) {
-        joycon2_decode_and_handle_report(buf.data, buf.len, buf.interface);
-    } else {
-        if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
-            //        printk("error in k_msg_put(report_q\n");
-        }
+    // Joy-Con 2 uses its own GATT subscription (joycon2_notify_cb), not HOGP - so this is HID only
+    if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
+        //        printk("error in k_msg_put(report_q\n");
     }
-
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -615,13 +600,6 @@ static void hogp_ready_work_fn(struct k_work* work) {
         bt_foreach_bond(BT_ID_DEFAULT, find_bond_cb, &find_bond);
         LOG_DBG("found bond idx: %d", find_bond.found_idx);
         device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
-
-        // Joy-Con 2 GATT discovery is now handled in discovery_completed_cb
-        struct bt_conn* conn = bt_hogp_conn(item.hogp);
-        uint8_t conn_idx = bt_conn_index(conn);
-        
-        // Clear device info for this connection
-        joycon2_cleanup_connection(conn_idx);
 
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
