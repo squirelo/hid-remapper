@@ -26,10 +26,90 @@
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
+#include "crc.h"  // If you have this from your receiver project
 
 LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
 #define CHK(X) ({ int err = X; if (err != 0) { LOG_ERR("%s returned %d (%s:%d)", #X, err, __FILE__, __LINE__); } err == 0; })
+
+// Peripheral mode support
+enum operation_mode {
+    MODE_HOST = 0,
+    MODE_PERIPHERAL = 1
+};
+
+static enum operation_mode current_mode = MODE_PERIPHERAL;
+
+// Nordic UART Service UUID - using standard Nordic UUIDs for Web Bluetooth compatibility
+static struct bt_uuid_128 uart_service_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 uart_rx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 uart_tx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
+
+// Add packet structure definitions similar to the receiver
+#define PROTOCOL_VERSION 1
+#define SERIAL_MAX_PACKET_SIZE 512
+
+#define END 0300     /* indicates end of packet */
+#define ESC 0333     /* indicates byte stuffing */
+#define ESC_END 0334 /* ESC ESC_END means END data byte */
+#define ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
+
+typedef struct __attribute__((packed)) {
+    uint8_t protocol_version;
+    uint8_t our_descriptor_number;
+    uint8_t len;
+    uint8_t report_id;
+    uint8_t data[0];
+} packet_t;
+
+// Add after the packet structure definitions
+typedef struct {
+    uint8_t report_id;
+    uint8_t len;
+    uint8_t data[64];
+} outgoing_report_t;
+
+#define OR_BUFSIZE 8
+static outgoing_report_t outgoing_reports[OR_BUFSIZE];
+static uint8_t or_head = 0;
+static uint8_t or_tail = 0;
+static uint8_t or_items = 0;
+
+static void queue_outgoing_report(uint8_t report_id, uint8_t* data, uint8_t len) {
+    if (or_items == OR_BUFSIZE) {
+        LOG_WRN("Report queue overflow!");
+        return;
+    }
+    outgoing_reports[or_tail].report_id = report_id;
+    outgoing_reports[or_tail].len = len;
+    memcpy(outgoing_reports[or_tail].data, data, len);
+    or_tail = (or_tail + 1) % OR_BUFSIZE;
+    or_items++;
+}
+
+// Packet buffer and state for SLIP-like framing
+static uint8_t packet_buffer[SERIAL_MAX_PACKET_SIZE];
+static uint16_t bytes_read = 0;
+static bool escaped = false;
+
+static void peripheral_mode_init(void);
+static void process_peripheral_command(uint8_t* buf, int count);
+static void start_peripheral_advertising(void);
+static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len);
+
+static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                            const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static void uart_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
+static void peripheral_connected(struct bt_conn *conn, uint8_t err);
+static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason);
 
 static const int SCAN_DELAY_MS = 1000;
 static const int CLEAR_BONDS_BUTTON_PRESS_MS = 3000;
@@ -87,6 +167,23 @@ K_MSGQ_DEFINE(disconnected_q, sizeof(struct disconnected_type), CONFIG_BT_MAX_CO
 K_MSGQ_DEFINE(set_report_q, sizeof(struct set_report_type), 8, 4);
 ATOMIC_DEFINE(tick_pending, 1);
 
+// Peripheral mode GATT service definitions
+static struct bt_conn *peripheral_conn;
+
+// Use Zephyr's simplified GATT service macro
+BT_GATT_SERVICE_DEFINE(uart_service,
+    BT_GATT_PRIMARY_SERVICE(&uart_service_uuid),
+    BT_GATT_CHARACTERISTIC(&uart_rx_uuid.uuid,
+                          BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+                          BT_GATT_PERM_WRITE, NULL, uart_write_cb, NULL),
+    BT_GATT_CHARACTERISTIC(&uart_tx_uuid.uuid,
+                          BT_GATT_CHRC_NOTIFY,
+                          BT_GATT_PERM_NONE, NULL, NULL, NULL),
+    BT_GATT_CCC(uart_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+
+
 #define SW0_NODE DT_ALIAS(sw0)
 #if !DT_NODE_HAS_STATUS(SW0_NODE, okay)
 #error "Unsupported board: sw0 devicetree alias is not defined"
@@ -112,7 +209,7 @@ static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static bool scanning = false;
 static bool peers_only = true;
 
-static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(6, 6, 44, 400);
+static struct bt_le_conn_param* conn_param = BT_LE_CONN_PARAM(12, 24, 0, 3000);
 
 static void activity_led_off_work_fn(struct k_work* work) {
     gpio_pin_set_dt(&led0, false);
@@ -171,6 +268,69 @@ static void set_led_mode(LedMode led_mode_) {
         k_work_reschedule(&led_work, K_NO_WAIT);
     }
 }
+
+// Peripheral mode callbacks
+static ssize_t uart_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                            const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+    if (current_mode == MODE_PERIPHERAL) {
+        process_peripheral_command((uint8_t*)buf, len);
+    }
+    return len;
+}
+
+static void uart_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    LOG_DBG("UART CCC changed: %d", value);
+    // Handle notification enable/disable
+}
+
+static void peripheral_connected(struct bt_conn *conn, uint8_t err)
+{
+    if (err) {
+        LOG_ERR("Peripheral connection failed (err %u)", err);
+        return;
+    }
+    
+    if (current_mode == MODE_PERIPHERAL) {
+        peripheral_conn = bt_conn_ref(conn);
+        LOG_INF("Peripheral connected");
+        set_led_mode(LedMode::ON);
+        
+        // Request stable connection parameters for peripheral mode
+        struct bt_le_conn_param param = {
+            .interval_min = 12,  // 15ms minimum
+            .interval_max = 24,  // 30ms maximum  
+            .latency = 0,        // No latency for real-time data
+            .timeout = 3000      // 30 second timeout
+        };
+        
+        int ret = bt_conn_le_param_update(conn, &param);
+        if (ret) {
+            LOG_WRN("Failed to update connection parameters: %d", ret);
+        } else {
+            LOG_INF("Requested stable connection parameters");
+        }
+    }
+}
+
+static void peripheral_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    if (current_mode == MODE_PERIPHERAL && conn == peripheral_conn) {
+        LOG_INF("Peripheral disconnected (reason %u)", reason);
+        bt_conn_unref(peripheral_conn);
+        peripheral_conn = NULL;
+        set_led_mode(LedMode::BLINK);
+        
+        // Restart advertising
+        start_peripheral_advertising();
+    }
+}
+
+BT_CONN_CB_DEFINE(peripheral_conn_callbacks) = {
+    .connected = peripheral_connected,
+    .disconnected = peripheral_disconnected,
+};
 
 static void scan_start() {
     if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE))) {
@@ -240,6 +400,12 @@ static bool scan_setup_filters() {
 }
 
 static void scan_start_work_fn(struct k_work* work) {
+    // Don't scan aggressively when in peripheral mode to avoid interference
+    if (current_mode == MODE_PERIPHERAL && peripheral_conn) {
+        LOG_DBG("Skipping scan - peripheral mode with active connection");
+        return;
+    }
+    
     if (scanning) {
         scan_stop();
     }
@@ -336,7 +502,7 @@ static void patch_broken_uuids(struct bt_gatt_dm* dm) {
                 bt_uuid_to_str(attr->uuid, str1, sizeof(str2));
                 *((bt_uuid_16*) attr->uuid) = {
                     .uuid = { BT_UUID_TYPE_16 },
-                    .val = (BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
+                    .val = (uint16_t)(BT_UUID_128(attr->uuid)->val[13] << 8 | BT_UUID_128(attr->uuid)->val[12])
                 };
                 bt_uuid_to_str(attr->uuid, str2, sizeof(str2));
                 LOG_INF("%s -> %s", str1, str2);
@@ -386,8 +552,253 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
         if (k_uptime_get() - button_pressed_at > CLEAR_BONDS_BUTTON_PRESS_MS) {
             clear_bonds();
         } else {
-            pair_new_device();
+            // Toggle between host and peripheral mode
+            if (current_mode == MODE_HOST) {
+                current_mode = MODE_PERIPHERAL;
+                LOG_INF("Switching to peripheral mode");
+                peripheral_mode_init();
+            } else {
+                current_mode = MODE_HOST;
+                LOG_INF("Switching to host mode");
+                pair_new_device();
+            }
         }
+    }
+}
+
+// Virtual gamepad neutral state following horipad pattern
+static const uint8_t virtual_gamepad_neutral[] = { 0x00, 0x00, 0x0F, 0x80, 0x80, 0x80, 0x80, 0x00 };
+
+// Virtual gamepad helper functions following horipad pattern
+static void virtual_gamepad_clear_report(uint8_t* report, uint8_t report_id, uint16_t len) {
+    memcpy(report, virtual_gamepad_neutral, sizeof(virtual_gamepad_neutral));
+}
+
+static int32_t virtual_gamepad_default_value(uint32_t usage) {
+    switch (usage) {
+        case 0x00010039:  // Hat switch
+            return 15;    // Neutral hat switch position (matches horipad)
+        case 0x00010030:  // X axis
+        case 0x00010031:  // Y axis  
+        case 0x00010032:  // Z axis
+        case 0x00010035:  // Rz axis
+            return 0x80;  // Center position for analog sticks (matches horipad)
+        default:
+            return 0;
+    }
+}
+
+// Peripheral mode implementation functions
+static void peripheral_mode_init(void) {
+    // Stop host mode scanning
+    if (scanning) {
+        scan_stop();
+    }
+    
+    // Disconnect any existing host connections
+    bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn, NULL);
+    
+    // Initialize packet reception state
+    bytes_read = 0;
+    escaped = false;
+    
+    // Create a virtual transmitter device that represents the input source
+    // This should match the descriptor of the device that's transmitting to us
+    uint16_t virtual_interface = 0xFF00;  // Will be changed to actual interface after parsing
+    
+    // For peripheral mode, we need to set up a virtual input device descriptor
+    // that matches what the transmitter is sending. Use a standard gamepad descriptor
+    // that should work with most common input formats.
+    
+    // Virtual gamepad descriptor with Report ID to match firmware format expectations
+    static const uint8_t virtual_gamepad_descriptor[] = {
+        0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
+        0x09, 0x05,        // Usage (Game Pad)
+        0xA1, 0x01,        // Collection (Application)
+        0x85, 0x01,        //   Report ID (1) - Add report ID to match firmware format
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x35, 0x00,        //   Physical Minimum (0)
+        0x45, 0x01,        //   Physical Maximum (1)
+        0x75, 0x01,        //   Report Size (1)
+        0x95, 0x0E,        //   Report Count (14) - 14 buttons like horipad
+        0x05, 0x09,        //   Usage Page (Button)
+        0x19, 0x01,        //   Usage Minimum (0x01)
+        0x29, 0x0E,        //   Usage Maximum (0x0E)
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x95, 0x02,        //   Report Count (2) - 2-bit padding like horipad
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+        0x25, 0x0F,        //   Logical Maximum (15) - to match transmitter dpad_lut
+        0x46, 0x3B, 0x01,  //   Physical Maximum (315)
+        0x75, 0x04,        //   Report Size (4)
+        0x95, 0x01,        //   Report Count (1)
+        0x65, 0x14,        //   Unit (System: English Rotation, Length: Centimeter)
+        0x09, 0x39,        //   Usage (Hat switch)
+        0x81, 0x42,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,Null State)
+        0x65, 0x00,        //   Unit (None)
+        0x95, 0x01,        //   Report Count (1) - 4-bit padding
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+        0x46, 0xFF, 0x00,  //   Physical Maximum (255)
+        0x09, 0x30,        //   Usage (X)
+        0x09, 0x31,        //   Usage (Y)
+        0x09, 0x32,        //   Usage (Z)
+        0x09, 0x35,        //   Usage (Rz)
+        0x75, 0x08,        //   Report Size (8)
+        0x95, 0x04,        //   Report Count (4)
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x75, 0x08,        //   Report Size (8) - like horipad
+        0x95, 0x01,        //   Report Count (1) - 1 padding byte
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0xC0,              // End Collection
+    };
+    
+    // Parse the virtual transmitter descriptor following horipad pattern
+    // Use interface 0 (like first real HID interface in host mode)
+    virtual_interface = 0x0000;  // Use proper interface 0x0000
+    
+    // CRITICAL: Clear any existing interface indexes to ensure virtual device gets index 0
+    // This prevents button offset issues where virtual device gets assigned index 8 
+    // and buttons appear as 9,10,11,12 instead of 1,2,3,4
+    interface_index_in_use = 0;
+    interface_index.clear();
+    
+    parse_descriptor(0x0F0D, 0x00C1,  // Use horipad VID/PID as reference
+                    virtual_gamepad_descriptor, 
+                    sizeof(virtual_gamepad_descriptor), 
+                    virtual_interface, 0);
+    device_connected_callback(virtual_interface, 0x0F0D, 0x00C1, 0);
+    
+    // Force update of their descriptor derivates for the virtual device
+    their_descriptor_updated = true;
+    
+    // Set LED to indicate peripheral mode (blinking = advertising/waiting for connection)
+    set_led_mode(LedMode::BLINK);
+    
+    // Start advertising
+    start_peripheral_advertising();
+    
+    LOG_INF("Peripheral mode initialized with virtual gamepad descriptor");
+}
+
+static void start_peripheral_advertising(void) {
+    struct bt_le_adv_param adv_param = {
+        .id = BT_ID_DEFAULT,
+        .sid = 0,
+        .secondary_max_skip = 0,
+        .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer = NULL,
+    };
+
+    static const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, "HID Remapper", 12),
+        BT_DATA_BYTES(BT_DATA_UUID128_ALL, 
+                      0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                      0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e),
+    };
+
+    CHK(bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), NULL, 0));
+    LOG_INF("Peripheral advertising started as 'HID Remapper'");
+}
+
+static void handle_received_packet(const uint8_t* data, uint16_t len) {
+    if (len < sizeof(packet_t)) {
+        LOG_WRN("Packet too small: %d < %d", len, sizeof(packet_t));
+        return;
+    }
+    
+    packet_t* msg = (packet_t*) data;
+    uint16_t payload_len = len - sizeof(packet_t);
+    
+    LOG_DBG("Packet validation: proto=%d (expect %d), len=%d, payload=%d, desc=%d, report_id=%d", 
+            msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
+            msg->our_descriptor_number, msg->report_id);
+    
+    if ((msg->protocol_version != PROTOCOL_VERSION) ||
+        (msg->len != payload_len) ||
+        (payload_len > 64) ||
+        (msg->our_descriptor_number >= NOUR_DESCRIPTORS) ||
+        ((msg->report_id == 0) && (payload_len >= 64))) {
+        LOG_WRN("Invalid packet: proto=%d (expect %d), len=%d vs %d, desc=%d (max %d), report_id=%d", 
+                msg->protocol_version, PROTOCOL_VERSION, msg->len, payload_len, 
+                msg->our_descriptor_number, NOUR_DESCRIPTORS, msg->report_id);
+        return;
+    }
+    
+    // Handle descriptor change
+    if (msg->our_descriptor_number != our_descriptor_number) {
+        our_descriptor_number = msg->our_descriptor_number;
+        
+        // Signal that configuration needs to be updated
+        config_updated = true;
+        
+        LOG_INF("Descriptor number changed to %d", our_descriptor_number);
+    }
+    
+    // Pass the raw gamepad data with external report ID
+    // Don't prepend report_id since it's passed as external_report_id parameter
+    handle_received_report(msg->data, len, 0x0000, msg->report_id);
+    
+    LOG_DBG("Packet processed: proto=%d, desc=%d, report_id=%d, len=%d", 
+            msg->protocol_version, msg->our_descriptor_number, msg->report_id, len);
+}
+
+static void process_byte_with_framing(uint8_t c) {
+    bytes_read %= sizeof(packet_buffer);
+
+    if (escaped) {
+        switch (c) {
+            case ESC_END:
+                packet_buffer[bytes_read++] = END;
+                break;
+            case ESC_ESC:
+                packet_buffer[bytes_read++] = ESC;
+                break;
+            default:
+                // this shouldn't happen
+                packet_buffer[bytes_read++] = c;
+                break;
+        }
+        escaped = false;
+    } else {
+        switch (c) {
+            case END:
+                if (bytes_read > 4) {
+                    uint32_t crc = crc32(packet_buffer, bytes_read - 4);
+                    // Read CRC in little-endian format (matches transmitter)
+                    uint32_t received_crc = 
+                        (packet_buffer[bytes_read - 4] << 0) |
+                        (packet_buffer[bytes_read - 3] << 8) |
+                        (packet_buffer[bytes_read - 2] << 16) |
+                        (packet_buffer[bytes_read - 1] << 24);
+                    if (crc == received_crc) {
+                        handle_received_packet(packet_buffer, bytes_read - 4);
+                        LOG_DBG("Packet received successfully, CRC: 0x%08X", crc);
+                    } else {
+                        LOG_WRN("CRC error: expected 0x%08X, got 0x%08X", crc, received_crc);
+                    }
+                }
+                bytes_read = 0;
+                break;
+            case ESC:
+                escaped = true;
+                break;
+            default:
+                packet_buffer[bytes_read++] = c;
+                break;
+        }
+    }
+}
+
+static void process_peripheral_command(uint8_t* buf, int count) {
+    // Process each byte with SLIP-like framing
+    LOG_DBG("Received %d bytes from BLE", count);
+    for (int i = 0; i < count; i++) {
+        process_byte_with_framing(buf[i]);
     }
 }
 
@@ -402,8 +813,10 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
-        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-
+        // Only restart scanning if we're in host mode
+        if (current_mode == MODE_HOST) {
+            k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+        }
         return;
     }
 
@@ -430,7 +843,10 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
     count_connections();
 
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    // Only restart scanning if we're in host mode
+    if (current_mode == MODE_HOST) {
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    }
 }
 
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
@@ -441,7 +857,10 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     if (!err) {
         LOG_INF("%s, level=%u.", addr, level);
         peers_only = true;
-        gatt_discover(conn);
+        // Only start discovery if we're in host mode
+        if (current_mode == MODE_HOST) {
+            gatt_discover(conn);
+        }
     } else {
         LOG_ERR("security failed: %s, level=%u, err=%d", addr, level, err);
     }
@@ -452,8 +871,15 @@ static void le_param_updated(struct bt_conn* conn, uint16_t interval, uint16_t l
 }
 
 static bool le_param_req(struct bt_conn* conn, struct bt_le_conn_param* param) {
-    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", param->interval_min, param->interval_max, param->latency, param->timeout);
-    param->interval_max = param->interval_min;
+    LOG_INF("interval_min=%d, interval_max=%d, latency=%d, timeout=%d", 
+            param->interval_min, param->interval_max, param->latency, param->timeout);
+    
+    // Accept wider range of parameters for better compatibility
+    if (param->interval_min < 6) param->interval_min = 6;     // Minimum 7.5ms
+    if (param->interval_max > 800) param->interval_max = 800; // Maximum 1000ms
+    if (param->timeout < 100) param->timeout = 100;          // Minimum 1s timeout
+    if (param->timeout > 3200) param->timeout = 3200;        // Maximum 32s timeout
+    
     return true;
 }
 
@@ -495,10 +921,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
         return BT_GATT_ITER_STOP;
     }
 
-    if (scanning) {
+    // Don't aggressively restart scanning if we're in peripheral mode
+    if (scanning && current_mode != MODE_PERIPHERAL) {
         scanning = false;  // more reports can come in before we actually stop scanning; there's probably a scenario where this causes trouble though
         k_work_submit(&scan_stop_work);
-    } else {
+    } else if (current_mode != MODE_PERIPHERAL) {
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
     }
 
@@ -713,11 +1140,21 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
         len--;
     }
     if (interface == 0) {
-        return CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL));
+        // Try to send immediately
+        if (CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL))) {
+            return true;
+        } else {
+            // Failed to send, queue it
+            if (len > 0) {
+                queue_outgoing_report(report_with_id[0], (uint8_t*)(report_with_id + 1), len - 1);
+            }
+            return false;
+        }
     }
     if (interface == 1) {
         return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
+    return false;  // Default case - interface not supported
 }
 
 static void button_init() {
@@ -915,7 +1352,12 @@ int main() {
     parse_our_descriptor();
     set_mapping_from_config();
 
-    k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    // Start in the appropriate mode
+    if (current_mode == MODE_HOST) {
+        k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
+    } else {
+        peripheral_mode_init();
+    }
 
     struct report_type incoming_report;
     struct descriptor_type incoming_descriptor;
@@ -926,13 +1368,40 @@ int main() {
     bool get_report_response_pending = false;
 
     while (true) {
-        if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
-            handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
-            process_pending = true;
+        // Host mode functionality
+        if (current_mode == MODE_HOST) {
+            if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
+                handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
+                process_pending = true;
+            }
+            if (atomic_test_and_clear_bit(tick_pending, 0)) {
+                process_mapping(true);
+                process_pending = false;
+            }
+
+            while (!k_msgq_get(&disconnected_q, &disconnected_item, K_NO_WAIT)) {
+                LOG_INF("device_disconnected_callback conn_idx=%d", disconnected_item.conn_idx);
+                device_disconnected_callback(disconnected_item.conn_idx);
+            }
+
+            while (!k_msgq_get(&descriptor_q, &incoming_descriptor, K_NO_WAIT)) {
+                LOG_HEXDUMP_DBG(incoming_descriptor.data, incoming_descriptor.size, "incoming_descriptor");
+                parse_descriptor(1, 1, incoming_descriptor.data, incoming_descriptor.size, incoming_descriptor.conn_idx << 8, 0);
+            }
+
+            if (their_descriptor_updated) {
+                update_their_descriptor_derivates();
+                their_descriptor_updated = false;
+            }
         }
-        if (atomic_test_and_clear_bit(tick_pending, 0)) {
-            process_mapping(true);
-            process_pending = false;
+        
+        // Peripheral mode functionality - process reports from BLE transmitter
+        if (current_mode == MODE_PERIPHERAL) {
+            // In peripheral mode, we also need to process periodic ticks for remapping
+            if (atomic_test_and_clear_bit(tick_pending, 0)) {
+                process_mapping(true);
+                process_pending = false;
+            }
         }
         if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
             if (!send_report(do_send_report)) {
@@ -942,6 +1411,23 @@ int main() {
         if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
             if (!send_monitor_report(do_send_report)) {
                 k_sem_give(&usb_sem1);
+            }
+        }
+
+        // Process queued outgoing reports when USB HID is ready
+        if ((or_items > 0) && (k_sem_take(&usb_sem0, K_NO_WAIT) == 0)) {
+            uint8_t report_with_id[65];
+            report_with_id[0] = outgoing_reports[or_head].report_id;
+            memcpy(report_with_id + 1, outgoing_reports[or_head].data, outgoing_reports[or_head].len);
+            
+            if (do_send_report(0, report_with_id, outgoing_reports[or_head].len + 1)) {
+                // Successfully sent, remove from queue
+                // Semaphore will be released by USB callback
+                or_head = (or_head + 1) % OR_BUFSIZE;
+                or_items--;
+            } else {
+                // Failed to send, give back semaphore
+                k_sem_give(&usb_sem0);
             }
         }
 

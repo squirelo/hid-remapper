@@ -1,0 +1,15 @@
+identifier: holyiot_22046
+name: Holyiot 22046 nRF52840
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+supported:
+  - usb_device
+  - ble
+  - watchdog
+  - counter
+ram: 256
+flash: 1024
