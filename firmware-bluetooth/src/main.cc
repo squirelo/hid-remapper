@@ -289,28 +289,9 @@ static void scan_filter_match(struct bt_scan_device_info* device_info, struct bt
 
     LOG_INF("%s address: %s connectable: %s", __func__, addr, connectable ? "yes" : "no");
 
-    // Check if this is a Joy-Con 2 device
     if (joycon2_is_device(device_info)) {
         LOG_INF("Joy-Con 2 detected at %s", addr);
-        
-        // Store device info for later use in connection
-        for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
-            if (!joycon2_is_connection(i)) {
-                joycon2_store_device_info(device_info, i);
-                LOG_INF("Joy-Con 2 device info stored for connection %d", i);
-                break;
-            }
-        }
-        
-        // In Zephyr, advertisement data is accessed through net_buf_simple
-        // We need to parse the advertisement data to find device name
-        const struct bt_le_scan_recv_info* recv_info = device_info->recv_info;
-        
-        LOG_INF("Checking device at %s for Joy-Con 2", addr);
-        
-        // TODO: Implement proper advertisement data parsing using net_buf_simple
-        // The advertisement data should be accessed through a separate parameter
-        // in the scan callback function, not through recv_info->data
+        joycon2_mark_candidate_addr(device_info->recv_info->addr);
     }
 }
 
@@ -384,6 +365,7 @@ static void discovery_completed_cb(struct bt_gatt_dm* dm, void* context) {
     if (joycon2_is_connection(conn_idx)) {
         LOG_INF("Joy-Con 2 discovery completed, discovering characteristics");
         joycon2_discover_characteristics(conn, dm);
+        CHK(joycon2_subscribe_input(conn));
         
         // Enable sensors for Joy-Con 2
         struct joycon2_connection* joycon2_conn = joycon2_find_connection(conn);
@@ -457,6 +439,7 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
     }
 
     LOG_INF("%s", addr);
+    joycon2_assign_connection(conn);
 
     CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
 }
@@ -473,6 +456,8 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     if (bt_hogp_assign_check(&hogps[conn_idx])) {
         bt_hogp_release(&hogps[conn_idx]);
     }
+
+    joycon2_cleanup_connection(conn_idx);
 
     struct disconnected_type disconnected_item = { .conn_idx = conn_idx };
     CHK(k_msgq_put(&disconnected_q, &disconnected_item, K_NO_WAIT));
@@ -556,7 +541,7 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     buf.len = bt_hogp_rep_size(rep) + 1;
     buf.data[0] = bt_hogp_rep_id(rep);
 
-    memcpy(buf.data + 1, data, buf.len);
+    memcpy(buf.data + 1, data, buf.len - 1);
 
     // Check if this is a Joy-Con 2 connection
     if (joycon2_is_connection_by_conn(bt_hogp_conn(hogp))) {
@@ -617,12 +602,6 @@ static void hogp_ready_work_fn(struct k_work* work) {
         device_connected_callback(bt_conn_index(bt_hogp_conn(item.hogp)) << 8, 1, 1, find_bond.found_idx);
 
         // Joy-Con 2 GATT discovery is now handled in discovery_completed_cb
-        struct bt_conn* conn = bt_hogp_conn(item.hogp);
-        uint8_t conn_idx = bt_conn_index(conn);
-        
-        // Clear device info for this connection
-        joycon2_cleanup_connection(conn_idx);
-
         while (NULL != (rep = bt_hogp_rep_next(item.hogp, rep))) {
             if (bt_hogp_rep_type(rep) == BT_HIDS_REPORT_TYPE_INPUT) {
                 LOG_DBG("subscribing to report ID: %u", bt_hogp_rep_id(rep));
