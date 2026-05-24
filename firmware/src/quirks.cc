@@ -1567,6 +1567,360 @@ void apply_quirks(uint16_t vendor_id, uint16_t product_id, std::unordered_map<ui
             .logical_minimum = -32768,
             .logical_maximum = 32767,
         };
+        usage_map[69][0x00090002] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 8,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090003] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 9,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090001] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 10,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090004] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 11,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090005] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 27,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090006] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 17,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090007] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 35,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090008] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 31,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090009] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 22,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000a] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 14,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000d] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 24,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000e] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 12,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000b] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 23,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000c] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 13,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009000f] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 25,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090010] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 15,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090011] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 26,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090012] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 16,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090013] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 32,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090014] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 28,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090015] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 37,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090016] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 36,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090017] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 33,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090018] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 29,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00090019] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 34,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x0009001a] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 30,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0xfff90001] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 20,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0xfff90002] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 19,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0xfff90003] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 21,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0xfff90004] = (usage_def_t){
+            .report_id = 69,
+            .size = 1,
+            .bitpos = 18,
+            .is_relative = false,
+            .logical_minimum = 0,
+        };
+        usage_map[69][0x00010030] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 72,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00010031] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 88,
+            .is_relative = false,
+            .logical_minimum = 32767,  // sic
+            .logical_maximum = -32767,
+        };
+        usage_map[69][0x00010032] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 104,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00010035] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 120,
+            .is_relative = false,
+            .logical_minimum = 32767,  // sic
+            .logical_maximum = -32767,
+        };
+        usage_map[69][0x00010033] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 40,
+            .is_relative = false,
+            .logical_minimum = 0,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00010034] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 56,
+            .is_relative = false,
+            .logical_minimum = 0,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0001] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 136,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0002] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 152,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0003] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 168,
+            .is_relative = false,
+            .logical_minimum = 0,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0004] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 184,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0005] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 200,
+            .is_relative = false,
+            .logical_minimum = -32767,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0xfffb0006] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 216,
+            .is_relative = false,
+            .logical_minimum = 0,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200453] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 264,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200454] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 280,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200455] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 296,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200457] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 312,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200458] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 328,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
+        usage_map[69][0x00200459] = (usage_def_t){
+            .report_id = 69,
+            .size = 16,
+            .bitpos = 344,
+            .is_relative = false,
+            .logical_minimum = -32768,
+            .logical_maximum = 32767,
+        };
     }
 
     // apply user-defined quirks
