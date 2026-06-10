@@ -184,6 +184,58 @@ target_link_libraries(remapper_serial
 )
 pico_add_extra_outputs(remapper_serial)
 
+if((PICO_BOARD STREQUAL "pico_w") OR (PICO_BOARD STREQUAL "pico2_w"))
+add_executable(remapper_bluetooth
+    src/main.cc
+    src/remapper.cc
+    src/remapper_bluetooth.cc
+    src/ble_central.cc
+    src/ble_nus.cc
+    src/ble_shared.cc
+    src/ble_button_led.cc
+    src/crc.cc
+    src/descriptor_parser.cc
+    src/tinyusb_stuff.cc
+    src/our_descriptor.cc
+    src/globals.cc
+    src/config.cc
+    src/quirks.cc
+    src/interval_override.cc
+    src/tick.cc
+    src/ps_auth.cc
+)
+target_compile_definitions(remapper_bluetooth PUBLIC
+    REMAPPER_BLUETOOTH=1
+    CYW43_ENABLE_BLUETOOTH=1
+    PICO_FLASH_BANK_TOTAL_SIZE=(FLASH_SECTOR_SIZE*4)
+)
+target_include_directories(remapper_bluetooth PRIVATE
+    src
+    src/tusb_config_device
+    ${PICO_SDK_PATH}/lib/btstack/src/ble/gatt-service
+)
+target_link_libraries(remapper_bluetooth
+    pico_stdlib
+    pico_unique_id
+    hardware_flash
+    hardware_gpio
+    hardware_sync
+    pico_util
+    tinyusb_device
+    tinyusb_board
+    pico_btstack_ble
+    pico_btstack_cyw43
+    pico_cyw43_arch_threadsafe_background
+)
+pico_btstack_make_gatt_header(remapper_bluetooth PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src/ble_remapper.gatt
+    -I${PICO_SDK_PATH}/lib/btstack/src/ble/gatt-service)
+if(COMMAND suppress_btstack_warnings)
+    suppress_btstack_warnings()
+endif()
+pico_add_extra_outputs(remapper_bluetooth)
+endif()
+
 add_executable(flash_b_side
     src/flash_b_side.cc
     dual_b_binary.c
