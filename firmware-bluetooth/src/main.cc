@@ -28,6 +28,7 @@
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
+#include "crc.h"
 
 LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
@@ -35,6 +36,42 @@ LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
 static const int SCAN_DELAY_MS = 1000;
 static const int CLEAR_BONDS_BUTTON_PRESS_MS = 3000;
+static const uint16_t NUS_VIRTUAL_INTERFACE = 0x7f00;
+static const uint16_t NUS_VIRTUAL_VID = 0x0f0d;
+static const uint16_t NUS_VIRTUAL_PID = 0x00c1;
+
+static struct bt_uuid_128 nus_service_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 nus_rx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 nus_tx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
+
+#define NUS_PROTOCOL_VERSION 1
+#define NUS_PACKET_BUFFER_SIZE 512
+#define END 0300
+#define ESC 0333
+#define ESC_END 0334
+#define ESC_ESC 0335
+
+struct __attribute__((packed)) nus_packet_t {
+    uint8_t protocol_version;
+    uint8_t our_descriptor_number;
+    uint8_t len;
+    uint8_t report_id;
+    uint8_t data[0];
+};
+
+static uint8_t nus_packet_buffer[NUS_PACKET_BUFFER_SIZE];
+static uint16_t nus_bytes_read = 0;
+static bool nus_escaped = false;
+static bool nus_overflowed = false;
+static struct bt_conn* nus_conn;
 
 // these macros don't work in C++ when used directly ("taking address of temporary array")
 static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HIDS_VAL);
@@ -60,6 +97,7 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
 
 struct report_type {
     uint16_t interface;
+    uint8_t external_report_id;
     uint8_t len;
     uint8_t data[65];
 };
@@ -91,6 +129,33 @@ K_MSGQ_DEFINE(hogp_ready_q, sizeof(struct hogp_ready_type), CONFIG_BT_MAX_CONN, 
 K_MSGQ_DEFINE(disconnected_q, sizeof(struct disconnected_type), CONFIG_BT_MAX_CONN, 4);
 K_MSGQ_DEFINE(set_report_q, sizeof(struct set_report_type), 8, 4);
 ATOMIC_DEFINE(tick_pending, 1);
+
+static void nus_start_advertising(void);
+static void nus_init_virtual_device(void);
+static void nus_process_bytes(const uint8_t* data, uint16_t len);
+
+static ssize_t nus_rx_write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
+                               const void* buf, uint16_t len, uint16_t offset, uint8_t flags) {
+    if (conn == nus_conn) {
+        nus_process_bytes((const uint8_t*) buf, len);
+    }
+    return len;
+}
+
+static void nus_ccc_changed(const struct bt_gatt_attr* attr, uint16_t value) {
+    LOG_DBG("NUS CCC changed: %d", value);
+}
+
+BT_GATT_SERVICE_DEFINE(nus_service,
+    BT_GATT_PRIMARY_SERVICE(&nus_service_uuid),
+    BT_GATT_CHARACTERISTIC(&nus_rx_uuid.uuid,
+                           BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+                           BT_GATT_PERM_WRITE_ENCRYPT, NULL, nus_rx_write_cb, NULL),
+    BT_GATT_CHARACTERISTIC(&nus_tx_uuid.uuid,
+                           BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_NONE, NULL, NULL, NULL),
+    BT_GATT_CCC(nus_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
 
 #define SW0_NODE DT_ALIAS(sw0)
 #if !DT_NODE_HAS_STATUS(SW0_NODE, okay)
@@ -177,6 +242,195 @@ static void set_led_mode(LedMode led_mode_) {
     }
 }
 
+static const uint8_t nus_virtual_gamepad_descriptor[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
+    0x09, 0x05,        // Usage (Game Pad)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x01,        //   Report ID (1)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x35, 0x00,        //   Physical Minimum (0)
+    0x45, 0x01,        //   Physical Maximum (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x0E,        //   Report Count (14)
+    0x05, 0x09,        //   Usage Page (Button)
+    0x19, 0x01,        //   Usage Minimum (1)
+    0x29, 0x0E,        //   Usage Maximum (14)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x95, 0x02,        //   Report Count (2)
+    0x81, 0x01,        //   Input (Const)
+    0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+    0x25, 0x0F,        //   Logical Maximum (15)
+    0x46, 0x3B, 0x01,  //   Physical Maximum (315)
+    0x75, 0x04,        //   Report Size (4)
+    0x95, 0x01,        //   Report Count (1)
+    0x65, 0x14,        //   Unit (English Rotation)
+    0x09, 0x39,        //   Usage (Hat switch)
+    0x81, 0x42,        //   Input (Data,Var,Abs,Null State)
+    0x65, 0x00,        //   Unit (None)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x01,        //   Input (Const)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x46, 0xFF, 0x00,  //   Physical Maximum (255)
+    0x09, 0x30,        //   Usage (X)
+    0x09, 0x31,        //   Usage (Y)
+    0x09, 0x32,        //   Usage (Z)
+    0x09, 0x35,        //   Usage (Rz)
+    0x75, 0x08,        //   Report Size (8)
+    0x95, 0x04,        //   Report Count (4)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x75, 0x08,        //   Report Size (8)
+    0x95, 0x01,        //   Report Count (1)
+    0x81, 0x01,        //   Input (Const)
+    0xC0,              // End Collection
+};
+
+static void nus_init_virtual_device(void) {
+    parse_descriptor(NUS_VIRTUAL_VID, NUS_VIRTUAL_PID,
+                     nus_virtual_gamepad_descriptor,
+                     sizeof(nus_virtual_gamepad_descriptor),
+                     NUS_VIRTUAL_INTERFACE, 0);
+    device_connected_callback(NUS_VIRTUAL_INTERFACE, NUS_VIRTUAL_VID, NUS_VIRTUAL_PID, 0);
+    their_descriptor_updated = true;
+}
+
+static void nus_handle_packet(const uint8_t* data, uint16_t len) {
+    static uint8_t last_descriptor_warning = 0xff;
+
+    if (len < sizeof(nus_packet_t)) {
+        LOG_WRN("NUS packet too small: %d", len);
+        return;
+    }
+
+    const nus_packet_t* msg = (const nus_packet_t*) data;
+    uint16_t payload_len = len - sizeof(nus_packet_t);
+
+    if ((msg->protocol_version != NUS_PROTOCOL_VERSION) ||
+        (msg->len != payload_len) ||
+        (payload_len > 64) ||
+        (msg->our_descriptor_number >= NOUR_DESCRIPTORS) ||
+        ((msg->report_id == 0) && (payload_len >= 64))) {
+        LOG_WRN("Invalid NUS packet: proto=%d len=%d payload=%d desc=%d report_id=%d",
+                msg->protocol_version, msg->len, payload_len,
+                msg->our_descriptor_number, msg->report_id);
+        return;
+    }
+
+    if ((msg->our_descriptor_number != our_descriptor_number) &&
+        (msg->our_descriptor_number != last_descriptor_warning)) {
+        last_descriptor_warning = msg->our_descriptor_number;
+        LOG_WRN("NUS descriptor %d does not match active USB descriptor %d",
+                msg->our_descriptor_number, our_descriptor_number);
+    }
+
+    struct report_type report = {
+        .interface = NUS_VIRTUAL_INTERFACE,
+        .external_report_id = msg->report_id,
+        .len = (uint8_t) payload_len,
+    };
+    memcpy(report.data, msg->data, payload_len);
+    if (k_msgq_put(&report_q, &report, K_NO_WAIT)) {
+        LOG_WRN("Dropped NUS report: report queue full");
+    }
+}
+
+static void nus_packet_append(uint8_t c) {
+    if (nus_bytes_read >= sizeof(nus_packet_buffer)) {
+        if (!nus_overflowed) {
+            LOG_WRN("NUS packet too large; dropping until frame end");
+        }
+        nus_overflowed = true;
+        return;
+    }
+    nus_packet_buffer[nus_bytes_read++] = c;
+}
+
+static void nus_process_byte(uint8_t c) {
+    if (nus_escaped) {
+        switch (c) {
+            case ESC_END:
+                nus_packet_append(END);
+                break;
+            case ESC_ESC:
+                nus_packet_append(ESC);
+                break;
+            default:
+                nus_packet_append(c);
+                break;
+        }
+        nus_escaped = false;
+        return;
+    }
+
+    switch (c) {
+        case END:
+            if (!nus_overflowed && (nus_bytes_read > 4)) {
+                uint32_t crc = crc32(nus_packet_buffer, nus_bytes_read - 4);
+                uint32_t received_crc =
+                    (nus_packet_buffer[nus_bytes_read - 4] << 0) |
+                    (nus_packet_buffer[nus_bytes_read - 3] << 8) |
+                    (nus_packet_buffer[nus_bytes_read - 2] << 16) |
+                    (nus_packet_buffer[nus_bytes_read - 1] << 24);
+                if (crc == received_crc) {
+                    nus_handle_packet(nus_packet_buffer, nus_bytes_read - 4);
+                } else {
+                    LOG_WRN("NUS CRC error: expected 0x%08X, got 0x%08X", crc, received_crc);
+                }
+            }
+            nus_bytes_read = 0;
+            nus_escaped = false;
+            nus_overflowed = false;
+            break;
+        case ESC:
+            if (!nus_overflowed) {
+                nus_escaped = true;
+            }
+            break;
+        default:
+            nus_packet_append(c);
+            break;
+    }
+}
+
+static void nus_process_bytes(const uint8_t* data, uint16_t len) {
+    gpio_pin_set_dt(&led0, true);
+    k_work_reschedule(&activity_led_off_work, K_MSEC(50));
+
+    for (uint16_t i = 0; i < len; i++) {
+        nus_process_byte(data[i]);
+    }
+}
+
+static void nus_start_advertising(void) {
+    struct bt_le_adv_param adv_param = {
+        .id = BT_ID_DEFAULT,
+        .sid = 0,
+        .secondary_max_skip = 0,
+        .options = BT_LE_ADV_OPT_CONNECTABLE,
+        .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,
+        .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,
+        .peer = NULL,
+    };
+
+    static const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+            0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+            0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e),
+    };
+
+    static const struct bt_data sd[] = {
+        BT_DATA(BT_DATA_NAME_COMPLETE, "HID Remapper", sizeof("HID Remapper") - 1),
+    };
+
+    int err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err && err != -EALREADY) {
+        LOG_ERR("bt_le_adv_start returned %d", err);
+        return;
+    }
+    LOG_INF("NUS advertising started.");
+}
+
 static void scan_start() {
     if (CHK(bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE))) {
         LOG_DBG("Scanning started.");
@@ -201,6 +455,12 @@ static void process_bond(const struct bt_bond_info* info, void* user_data) {
 }
 
 static void count_conn_cb(struct bt_conn* conn, void* data) {
+    struct bt_conn_info info;
+
+    if (bt_conn_get_info(conn, &info) || (info.role != BT_CONN_ROLE_CENTRAL)) {
+        return;
+    }
+
     (*((int*) data))++;
 }
 
@@ -399,18 +659,34 @@ static void button_cb(const struct device* dev, struct gpio_callback* cb, uint32
 static void connected(struct bt_conn* conn, uint8_t conn_err) {
     char addr[BT_ADDR_LE_STR_LEN];
 
-    scanning = false;
-    count_connections();
-    set_led_mode(LedMode::BLINK);
-
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (conn_err=%u).", addr, conn_err);
         k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
-
         return;
     }
+
+    struct bt_conn_info info;
+    if (!CHK(bt_conn_get_info(conn, &info))) {
+        return;
+    }
+
+    if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+        if (!nus_conn) {
+            nus_conn = bt_conn_ref(conn);
+            LOG_INF("NUS client connected: %s", addr);
+            CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
+        } else {
+            LOG_WRN("Rejecting extra NUS client: %s", addr);
+            CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
+        }
+        return;
+    }
+
+    scanning = false;
+    count_connections();
+    set_led_mode(LedMode::BLINK);
 
     LOG_INF("%s", addr);
 
@@ -419,8 +695,24 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
 
 static void disconnected(struct bt_conn* conn, uint8_t reason) {
     char addr[BT_ADDR_LE_STR_LEN];
+    struct bt_conn_info info;
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+    if (conn == nus_conn) {
+        LOG_INF("NUS client disconnected: %s (reason=%u)", addr, reason);
+        bt_conn_unref(nus_conn);
+        nus_conn = NULL;
+        nus_bytes_read = 0;
+        nus_escaped = false;
+        nus_overflowed = false;
+        nus_start_advertising();
+        return;
+    }
+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        LOG_INF("Peripheral client disconnected: %s (reason=%u)", addr, reason);
+        return;
+    }
 
     LOG_INF("%s (reason=%u)", addr, reason);
 
@@ -440,6 +732,12 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
 
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
     char addr[BT_ADDR_LE_STR_LEN];
+    struct bt_conn_info info;
+
+    if ((conn == nus_conn) ||
+        (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL)) {
+        return;
+    }
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
@@ -509,10 +807,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
 
     static struct report_type buf;
     buf.interface = hogp_index(hogp) << 8;
+    buf.external_report_id = 0;
     buf.len = bt_hogp_rep_size(rep) + 1;
     buf.data[0] = bt_hogp_rep_id(rep);
 
-    memcpy(buf.data + 1, data, buf.len);
+    memcpy(buf.data + 1, data, buf.len - 1);
     if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
         //        printk("error in k_msg_put(report_q\n");
     }
@@ -520,18 +819,37 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     return BT_GATT_ITER_CONTINUE;
 }
 
-// XXX is this ready for simultaneous connection setup? is discovery ready? do we care?
-static struct descriptor_type their_descriptor;
+static struct descriptor_type their_descriptors[CONFIG_BT_MAX_CONN];
 
 static void hogp_map_read_cb(struct bt_hogp* hogp, uint8_t err, const uint8_t* data, size_t size, size_t offset) {
-    if (data == NULL) {
-        their_descriptor.size = offset;
-        their_descriptor.conn_idx = hogp_index(hogp);
-        CHK(k_msgq_put(&descriptor_q, &their_descriptor, K_NO_WAIT));
+    int8_t conn_idx = hogp_index(hogp);
+    if (conn_idx < 0) {
         return;
     }
 
-    memcpy(their_descriptor.data + offset, data, size);
+    if (err) {
+        LOG_ERR("HOGP descriptor read failed for conn_idx=%d err=%d", conn_idx, err);
+        return;
+    }
+
+    struct descriptor_type* their_descriptor = &their_descriptors[conn_idx];
+
+    if (data == NULL) {
+        their_descriptor->size = offset;
+        their_descriptor->conn_idx = conn_idx;
+        CHK(k_msgq_put(&descriptor_q, their_descriptor, K_NO_WAIT));
+        return;
+    }
+
+    if (offset >= sizeof(their_descriptor->data)) {
+        LOG_WRN("HOGP descriptor too large for conn_idx=%d; dropping remainder", conn_idx);
+        return;
+    }
+    if ((offset + size) > sizeof(their_descriptor->data)) {
+        LOG_WRN("HOGP descriptor too large for conn_idx=%d; truncating", conn_idx);
+        size = sizeof(their_descriptor->data) - offset;
+    }
+    memcpy(their_descriptor->data + offset, data, size);
 
     bt_hogp_map_read(hogp, hogp_map_read_cb, offset + size, K_NO_WAIT);
 }
@@ -690,6 +1008,7 @@ static void int_out_ready_cb0(const struct device* dev) {
     uint32_t len;
     if (CHK(hid_int_ep_read(hid_dev0, buf.data, sizeof(buf.data), &len))) {
         buf.interface = OUR_OUT_INTERFACE;
+        buf.external_report_id = 0;
         buf.len = len;
         CHK(k_msgq_put(&report_q, &buf, K_NO_WAIT));
     }
@@ -921,7 +1240,11 @@ int main() {
     scan_init();
     parse_our_descriptor();
     set_mapping_from_config();
-    
+    nus_init_virtual_device();
+    update_their_descriptor_derivates();
+    their_descriptor_updated = false;
+    nus_start_advertising();
+
     // Initialize 6-axis IMU AFTER mapping system is ready
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
     if (imu_enabled) {
@@ -947,7 +1270,9 @@ int main() {
 
     while (true) {
         if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
-            handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
+            handle_received_report(incoming_report.data, incoming_report.len,
+                                   (uint16_t) incoming_report.interface,
+                                   incoming_report.external_report_id);
             process_pending = true;
         }
         if (atomic_test_and_clear_bit(tick_pending, 0)) {

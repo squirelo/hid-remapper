@@ -25,13 +25,16 @@ jobs:
             name: "seeed_xiao_nrf52840_sense"
             extra_args: "-- \"-DOVERLAY_CONFIG=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.conf\" \"-DDTC_OVERLAY_FILE=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.overlay\""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build
         run: |
           docker run -v $PWD:/workdir/project -w /workdir/project/firmware-bluetooth nordicplayground/nrfconnect-sdk:v2.2-branch \
             west build -b ${{ matrix.board }} ${{ matrix.extra_args }}
           cp firmware-bluetooth/build/zephyr/remapper.uf2 firmware-bluetooth/remapper_${{ matrix.name }}.uf2
-      - uses: actions/upload-artifact@v4
+          cp firmware-bluetooth/build/zephyr/remapper.hex firmware-bluetooth/remapper_${{ matrix.name }}.hex
+      - uses: actions/upload-artifact@v7
         with:
           name: artifact-${{ matrix.name }}
-          path: firmware-bluetooth/remapper_${{ matrix.name }}.uf2
+          path: |
+            firmware-bluetooth/remapper_${{ matrix.name }}.uf2
+            firmware-bluetooth/remapper_${{ matrix.name }}.hex
