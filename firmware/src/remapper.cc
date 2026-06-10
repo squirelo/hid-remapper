@@ -398,6 +398,7 @@ void set_mapping_from_config() {
     memset(input_state, 0, sizeof(input_state));
     memset(tap_hold_state, 0, sizeof(tap_hold_state));
     memset(sticky_state, 0, sizeof(sticky_state));
+    active_ports_mask = 0;
     uint32_t gpio_in_mask_ = 0;
     uint32_t gpio_out_mask_ = 0;
 
@@ -1656,6 +1657,9 @@ void do_handle_received_report(const uint8_t* report, int len, uint16_t interfac
 
     uint8_t interface_idx = interface_index[interface];
     uint8_t hub_port = hub_ports[interface >> 8];
+    if (hub_port != HUB_PORT_NONE) {
+        active_ports_mask |= 1 << hub_port;
+    }
 
     if (!is_rollover(report, len, interface, report_id)) {
         for (int32_t* state_ptr : array_range_usages[interface][report_id]) {
@@ -1687,6 +1691,9 @@ void do_handle_received_report(const uint8_t* report, int len, uint16_t interfac
 void handle_received_midi(uint8_t hub_port, uint8_t* midi_msg) {
     if (hub_port == 0) {
         hub_port = HUB_PORT_NONE;
+    }
+    if (hub_port != HUB_PORT_NONE) {
+        active_ports_mask |= 1 << hub_port;
     }
     uint32_t usage = 0;
     int32_t raw_val = 0;
@@ -1897,7 +1904,9 @@ void update_their_descriptor_derivates() {
     for (auto& rev_map : reverse_mapping) {
         for (auto& map_source : rev_map.sources) {
             map_source.is_relative = relative_usage_set.count(map_source.input_state) > 0;
-            map_source.is_binary = (binary_usage_set.count(map_source.input_state) > 0) ||
+            map_source.is_binary = ((binary_usage_set.count(map_source.input_state) > 0) &&
+                                       (map_source.usage != H_SCROLL_USAGE) &&
+                                       !((map_source.usage >= 0x00010030) && (map_source.usage <= 0x00010039))) ||
                                    ((map_source.usage & 0xFFFF0000) == GPIO_USAGE_PAGE);
         }
         auto search = their_out_usages_flat.find(rev_map.target);
@@ -2035,9 +2044,6 @@ void set_monitor_enabled(bool enabled) {
 
 void device_connected_callback(uint16_t interface, uint16_t vid, uint16_t pid, uint8_t hub_port) {
     hub_ports[interface >> 8] = (hub_port != 0) ? hub_port : HUB_PORT_NONE;
-    if (hub_port != 0) {
-        active_ports_mask |= 1 << hub_port;
-    }
     if (our_descriptor->device_connected != nullptr) {
         our_descriptor->device_connected(interface, vid, pid);
     }
