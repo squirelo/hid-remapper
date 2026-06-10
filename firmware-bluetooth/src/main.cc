@@ -73,6 +73,13 @@ static bool nus_escaped = false;
 static bool nus_overflowed = false;
 static struct bt_conn* nus_conn;
 
+#define NUS_LATENCY_INSTRUMENTATION 1
+#if NUS_LATENCY_INSTRUMENTATION
+static uint32_t nus_rx_cycles = 0;
+static bool nus_latency_pending = false;
+static uint32_t nus_latency_samples = 0;
+#endif
+
 // these macros don't work in C++ when used directly ("taking address of temporary array")
 static auto const BT_UUID_HIDS_ = (struct bt_uuid_16) BT_UUID_INIT_16(BT_UUID_HIDS_VAL);
 static auto BT_ADDR_LE_ANY_ = BT_ADDR_LE_ANY[0];
@@ -331,6 +338,11 @@ static void nus_handle_packet(const uint8_t* data, uint16_t len) {
     memcpy(report.data, msg->data, payload_len);
     if (k_msgq_put(&report_q, &report, K_NO_WAIT)) {
         LOG_WRN("Dropped NUS report: report queue full");
+    } else {
+#if NUS_LATENCY_INSTRUMENTATION
+        nus_rx_cycles = k_cycle_get_32();
+        nus_latency_pending = true;
+#endif
     }
 }
 
@@ -706,6 +718,9 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
         nus_bytes_read = 0;
         nus_escaped = false;
         nus_overflowed = false;
+#if NUS_LATENCY_INSTRUMENTATION
+        nus_latency_pending = false;
+#endif
         nus_start_advertising();
         return;
     }
@@ -730,12 +745,44 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
     k_work_reschedule(&scan_start_work, K_MSEC(SCAN_DELAY_MS));
 }
 
+static void nus_optimize_connection(struct bt_conn* conn) {
+    struct bt_le_conn_param param = {
+        .interval_min = 6,
+        .interval_max = 9,
+        .latency = 0,
+        .timeout = 400,
+    };
+    int err = bt_conn_le_param_update(conn, &param);
+    if (err) {
+        LOG_WRN("NUS conn param update failed: %d", err);
+    } else {
+        LOG_INF("NUS conn param update requested (7.5-11.25 ms)");
+    }
+
+#if defined(CONFIG_BT_CTLR_PHY_2M)
+    struct bt_conn_le_phy_param phy = BT_CONN_LE_PHY_PARAM_INIT(BT_GAP_LE_PHY_2M,
+                                                                  BT_GAP_LE_PHY_2M);
+    err = bt_conn_le_phy_update(conn, &phy);
+    if (err) {
+        LOG_WRN("NUS 2M PHY update failed: %d", err);
+    }
+#endif
+}
+
 static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_security_err err) {
     char addr[BT_ADDR_LE_STR_LEN];
     struct bt_conn_info info;
 
-    if ((conn == nus_conn) ||
-        (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL)) {
+    if (conn == nus_conn) {
+        if (!err && level >= BT_SECURITY_L2) {
+            nus_optimize_connection(conn);
+        } else if (err) {
+            LOG_ERR("NUS security failed: level=%u, err=%d", level, err);
+        }
+        return;
+    }
+
+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
         return;
     }
 
@@ -1036,13 +1083,22 @@ static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uin
         report_with_id++;
         len--;
     }
+    bool sent = false;
     if (interface == 0) {
-        return CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL));
+        sent = CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL));
+    } else if (interface == 1) {
+        sent = CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
     }
-    if (interface == 1) {
-        return CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
+#if NUS_LATENCY_INSTRUMENTATION
+    if (sent && interface == 0 && nus_latency_pending) {
+        uint32_t delta = k_cycle_get_32() - nus_rx_cycles;
+        nus_latency_pending = false;
+        if ((nus_latency_samples++ & 0x3f) == 0) {
+            LOG_INF("NUS RX->USB latency: %u us", k_cyc_to_us_near32(delta));
+        }
     }
-    return false;
+#endif
+    return sent;
 }
 
 static void button_init() {

@@ -19,7 +19,9 @@ let device;
 let server;
 let rxCharacteristic;
 let report = neutralReport();
-let writeQueue = Promise.resolve();
+let encryptedLinkReady = false;
+let reportDirty = false;
+let writeInFlight = false;
 
 function setStatus(message) {
     statusEl.textContent = message;
@@ -72,7 +74,7 @@ function framePacket(payload) {
     return new Uint8Array(framed);
 }
 
-async function sendCurrentReport() {
+async function sendCurrentReport(requireResponse = false) {
     if (!rxCharacteristic) {
         setStatus("Not connected");
         return;
@@ -86,30 +88,62 @@ async function sendCurrentReport() {
     payload.set(report, 4);
 
     const framed = framePacket(payload);
-    if (rxCharacteristic.writeValueWithResponse) {
+    const useResponse = requireResponse || !encryptedLinkReady;
+    const t0 = performance.now();
+
+    if (useResponse && rxCharacteristic.writeValueWithResponse) {
         await rxCharacteristic.writeValueWithResponse(framed);
+        encryptedLinkReady = true;
+    } else if (rxCharacteristic.writeValueWithoutResponse) {
+        await rxCharacteristic.writeValueWithoutResponse(framed);
     } else if (rxCharacteristic.writeValue) {
         await rxCharacteristic.writeValue(framed);
-    } else {
-        await rxCharacteristic.writeValueWithoutResponse(framed);
+    } else if (rxCharacteristic.writeValueWithResponse) {
+        await rxCharacteristic.writeValueWithResponse(framed);
+        encryptedLinkReady = true;
     }
 
-    setStatus(`Sent ${report.length} byte report over encrypted BLE to ${device.name || "HID Remapper"}`);
+    const elapsedMs = performance.now() - t0;
+    const mode = useResponse ? "encrypted write" : "fast write";
+    setStatus(`Sent ${report.length} byte report (${mode}, ${elapsedMs.toFixed(1)} ms) to ${device.name || "HID Remapper"}`);
 }
 
-function queueCurrentReport() {
-    writeQueue = writeQueue
-        .then(() => sendCurrentReport())
-        .catch((error) => {
-            setStatus(formatWriteError(error));
-        });
-    return writeQueue;
+async function flushReportWrites(requireResponse = false) {
+    writeInFlight = true;
+    try {
+        while (reportDirty) {
+            reportDirty = false;
+            const useResponse = requireResponse || !encryptedLinkReady;
+            await sendCurrentReport(useResponse);
+            requireResponse = false;
+        }
+    } catch (error) {
+        if (requireResponse || !encryptedLinkReady) {
+            encryptedLinkReady = false;
+        }
+        setStatus(formatWriteError(error));
+    } finally {
+        writeInFlight = false;
+        if (reportDirty) {
+            await flushReportWrites(false);
+        }
+    }
+}
+
+function queueCurrentReport(requireResponse = false) {
+    reportDirty = true;
+    if (writeInFlight) {
+        return Promise.resolve();
+    }
+    return flushReportWrites(requireResponse);
 }
 
 function onDisconnected() {
     rxCharacteristic = undefined;
     server = undefined;
-    writeQueue = Promise.resolve();
+    encryptedLinkReady = false;
+    reportDirty = false;
+    writeInFlight = false;
     setConnectedState(false);
     setStatus("Disconnected");
 }
@@ -132,8 +166,9 @@ async function connectWithOptions(options) {
         setStatus(`NUS service found on ${device.name || device.id}; opening write characteristic...`);
         rxCharacteristic = await service.getCharacteristic(NUS_RX_UUID);
 
+        encryptedLinkReady = false;
         setConnectedState(true);
-        setStatus(`Connected to ${device.name || "HID Remapper"}. The first write may ask to pair so the BLE link can be encrypted.`);
+        setStatus(`Connected to ${device.name || "HID Remapper"}. Use Pair / Send Neutral to trigger encryption, then reports use fast writes.`);
     } catch (error) {
         setStatus(error.message || String(error));
     }
@@ -161,7 +196,8 @@ disconnectButton.addEventListener("click", () => {
 
 pairButton.addEventListener("click", async () => {
     report = neutralReport();
-    await queueCurrentReport();
+    encryptedLinkReady = false;
+    await queueCurrentReport(true);
 });
 
 document.querySelector("#neutral").addEventListener("click", async () => {
