@@ -32,6 +32,9 @@ so they can be remapped together with connected BLE HID devices.
 * Write characteristic: `6e400002-b5a3-f393-e0a9-e50e24dcca9e`
 * Notify characteristic: `6e400003-b5a3-f393-e0a9-e50e24dcca9e`
 
+The write characteristic requires an encrypted BLE connection, so clients may
+need to pair before reports can be written.
+
 Writes are SLIP-style framed packets with a little-endian CRC32 trailer:
 start `0xc0`, escaped payload bytes, four CRC bytes, end `0xc0`.
 The decoded payload is:

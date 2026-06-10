@@ -61,6 +61,7 @@
         <div class="row">
             <button id="connect">Connect</button>
             <button id="connect-filtered">Connect by NUS UUID</button>
+            <button id="pair" disabled>Pair / test write</button>
             <button id="disconnect" disabled>Disconnect</button>
             <label>
                 Descriptor
@@ -72,7 +73,7 @@
                 </select>
             </label>
         </div>
-        <div id="status" class="status">Disconnected. Use Connect first; it shows every BLE device the browser can see.</div>
+        <div id="status" class="status">Disconnected. Use Connect first; the first write may ask to pair so the BLE link can be encrypted.</div>
     </div>
 
     <div class="panel">

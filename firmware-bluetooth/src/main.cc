@@ -68,6 +68,7 @@ struct __attribute__((packed)) nus_packet_t {
 static uint8_t nus_packet_buffer[NUS_PACKET_BUFFER_SIZE];
 static uint16_t nus_bytes_read = 0;
 static bool nus_escaped = false;
+static bool nus_overflowed = false;
 static struct bt_conn* nus_conn;
 
 // these macros don't work in C++ when used directly ("taking address of temporary array")
@@ -91,6 +92,7 @@ static const struct device* hid_dev1;  // config interface
 
 struct report_type {
     uint16_t interface;
+    uint8_t external_report_id;
     uint8_t len;
     uint8_t data[65];
 };
@@ -143,7 +145,7 @@ BT_GATT_SERVICE_DEFINE(nus_service,
     BT_GATT_PRIMARY_SERVICE(&nus_service_uuid),
     BT_GATT_CHARACTERISTIC(&nus_rx_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-                           BT_GATT_PERM_WRITE, NULL, nus_rx_write_cb, NULL),
+                           BT_GATT_PERM_WRITE_ENCRYPT, NULL, nus_rx_write_cb, NULL),
     BT_GATT_CHARACTERISTIC(&nus_tx_uuid.uuid,
                            BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_NONE, NULL, NULL, NULL),
@@ -316,22 +318,39 @@ static void nus_handle_packet(const uint8_t* data, uint16_t len) {
                 msg->our_descriptor_number, our_descriptor_number);
     }
 
-    handle_received_report(msg->data, payload_len, NUS_VIRTUAL_INTERFACE, msg->report_id);
+    struct report_type report = {
+        .interface = NUS_VIRTUAL_INTERFACE,
+        .external_report_id = msg->report_id,
+        .len = (uint8_t) payload_len,
+    };
+    memcpy(report.data, msg->data, payload_len);
+    if (k_msgq_put(&report_q, &report, K_NO_WAIT)) {
+        LOG_WRN("Dropped NUS report: report queue full");
+    }
+}
+
+static void nus_packet_append(uint8_t c) {
+    if (nus_bytes_read >= sizeof(nus_packet_buffer)) {
+        if (!nus_overflowed) {
+            LOG_WRN("NUS packet too large; dropping until frame end");
+        }
+        nus_overflowed = true;
+        return;
+    }
+    nus_packet_buffer[nus_bytes_read++] = c;
 }
 
 static void nus_process_byte(uint8_t c) {
-    nus_bytes_read %= sizeof(nus_packet_buffer);
-
     if (nus_escaped) {
         switch (c) {
             case ESC_END:
-                nus_packet_buffer[nus_bytes_read++] = END;
+                nus_packet_append(END);
                 break;
             case ESC_ESC:
-                nus_packet_buffer[nus_bytes_read++] = ESC;
+                nus_packet_append(ESC);
                 break;
             default:
-                nus_packet_buffer[nus_bytes_read++] = c;
+                nus_packet_append(c);
                 break;
         }
         nus_escaped = false;
@@ -340,7 +359,7 @@ static void nus_process_byte(uint8_t c) {
 
     switch (c) {
         case END:
-            if (nus_bytes_read > 4) {
+            if (!nus_overflowed && (nus_bytes_read > 4)) {
                 uint32_t crc = crc32(nus_packet_buffer, nus_bytes_read - 4);
                 uint32_t received_crc =
                     (nus_packet_buffer[nus_bytes_read - 4] << 0) |
@@ -354,12 +373,16 @@ static void nus_process_byte(uint8_t c) {
                 }
             }
             nus_bytes_read = 0;
+            nus_escaped = false;
+            nus_overflowed = false;
             break;
         case ESC:
-            nus_escaped = true;
+            if (!nus_overflowed) {
+                nus_escaped = true;
+            }
             break;
         default:
-            nus_packet_buffer[nus_bytes_read++] = c;
+            nus_packet_append(c);
             break;
     }
 }
@@ -648,6 +671,7 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
         if (!nus_conn) {
             nus_conn = bt_conn_ref(conn);
             LOG_INF("NUS client connected: %s", addr);
+            CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
         } else {
             LOG_WRN("Rejecting extra NUS client: %s", addr);
             CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
@@ -676,6 +700,7 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
         nus_conn = NULL;
         nus_bytes_read = 0;
         nus_escaped = false;
+        nus_overflowed = false;
         nus_start_advertising();
         return;
     }
@@ -777,10 +802,11 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
 
     static struct report_type buf;
     buf.interface = hogp_index(hogp) << 8;
+    buf.external_report_id = 0;
     buf.len = bt_hogp_rep_size(rep) + 1;
     buf.data[0] = bt_hogp_rep_id(rep);
 
-    memcpy(buf.data + 1, data, buf.len);
+    memcpy(buf.data + 1, data, buf.len - 1);
     if (k_msgq_put(&report_q, &buf, K_NO_WAIT)) {
         //        printk("error in k_msg_put(report_q\n");
     }
@@ -788,18 +814,37 @@ static uint8_t hogp_notify_cb(struct bt_hogp* hogp, struct bt_hogp_rep_info* rep
     return BT_GATT_ITER_CONTINUE;
 }
 
-// XXX is this ready for simultaneous connection setup? is discovery ready? do we care?
-static struct descriptor_type their_descriptor;
+static struct descriptor_type their_descriptors[CONFIG_BT_MAX_CONN];
 
 static void hogp_map_read_cb(struct bt_hogp* hogp, uint8_t err, const uint8_t* data, size_t size, size_t offset) {
-    if (data == NULL) {
-        their_descriptor.size = offset;
-        their_descriptor.conn_idx = hogp_index(hogp);
-        CHK(k_msgq_put(&descriptor_q, &their_descriptor, K_NO_WAIT));
+    int8_t conn_idx = hogp_index(hogp);
+    if (conn_idx < 0) {
         return;
     }
 
-    memcpy(their_descriptor.data + offset, data, size);
+    if (err) {
+        LOG_ERR("HOGP descriptor read failed for conn_idx=%d err=%d", conn_idx, err);
+        return;
+    }
+
+    struct descriptor_type* their_descriptor = &their_descriptors[conn_idx];
+
+    if (data == NULL) {
+        their_descriptor->size = offset;
+        their_descriptor->conn_idx = conn_idx;
+        CHK(k_msgq_put(&descriptor_q, their_descriptor, K_NO_WAIT));
+        return;
+    }
+
+    if (offset >= sizeof(their_descriptor->data)) {
+        LOG_WRN("HOGP descriptor too large for conn_idx=%d; dropping remainder", conn_idx);
+        return;
+    }
+    if ((offset + size) > sizeof(their_descriptor->data)) {
+        LOG_WRN("HOGP descriptor too large for conn_idx=%d; truncating", conn_idx);
+        size = sizeof(their_descriptor->data) - offset;
+    }
+    memcpy(their_descriptor->data + offset, data, size);
 
     bt_hogp_map_read(hogp, hogp_map_read_cb, offset + size, K_NO_WAIT);
 }
@@ -958,6 +1003,7 @@ static void int_out_ready_cb0(const struct device* dev) {
     uint32_t len;
     if (CHK(hid_int_ep_read(hid_dev0, buf.data, sizeof(buf.data), &len))) {
         buf.interface = OUR_OUT_INTERFACE;
+        buf.external_report_id = 0;
         buf.len = len;
         CHK(k_msgq_put(&report_q, &buf, K_NO_WAIT));
     }
@@ -1204,7 +1250,9 @@ int main() {
 
     while (true) {
         if (!process_pending && !k_msgq_get(&report_q, &incoming_report, K_NO_WAIT)) {
-            handle_received_report(incoming_report.data, incoming_report.len, (uint16_t) incoming_report.interface);
+            handle_received_report(incoming_report.data, incoming_report.len,
+                                   (uint16_t) incoming_report.interface,
+                                   incoming_report.external_report_id);
             process_pending = true;
         }
         if (atomic_test_and_clear_bit(tick_pending, 0)) {

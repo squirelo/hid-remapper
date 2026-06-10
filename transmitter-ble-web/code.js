@@ -12,6 +12,7 @@ const statusEl = document.querySelector("#status");
 const connectButton = document.querySelector("#connect");
 const connectFilteredButton = document.querySelector("#connect-filtered");
 const disconnectButton = document.querySelector("#disconnect");
+const pairButton = document.querySelector("#pair");
 const descriptorSelect = document.querySelector("#descriptor");
 
 let device;
@@ -32,6 +33,21 @@ function setConnectedState(connected) {
     connectButton.disabled = connected;
     connectFilteredButton.disabled = connected;
     disconnectButton.disabled = !connected;
+    pairButton.disabled = !connected;
+}
+
+function formatWriteError(error) {
+    const message = error.message || String(error);
+
+    if (error.name === "NetworkError" || /encrypt|security|auth|pair/i.test(message)) {
+        return `${message}. The firmware requires an encrypted BLE link; accept the browser or OS pairing prompt, then try again.`;
+    }
+
+    if (error.name === "NotAllowedError") {
+        return `${message}. Bluetooth access or pairing was cancelled.`;
+    }
+
+    return message;
 }
 
 function framePacket(payload) {
@@ -78,14 +94,14 @@ async function sendCurrentReport() {
         await rxCharacteristic.writeValueWithoutResponse(framed);
     }
 
-    setStatus(`Sent ${report.length} byte report to ${device.name || "HID Remapper"}`);
+    setStatus(`Sent ${report.length} byte report over encrypted BLE to ${device.name || "HID Remapper"}`);
 }
 
 function queueCurrentReport() {
     writeQueue = writeQueue
         .then(() => sendCurrentReport())
         .catch((error) => {
-            setStatus(error.message || String(error));
+            setStatus(formatWriteError(error));
         });
     return writeQueue;
 }
@@ -117,7 +133,7 @@ async function connectWithOptions(options) {
         rxCharacteristic = await service.getCharacteristic(NUS_RX_UUID);
 
         setConnectedState(true);
-        setStatus(`Connected to ${device.name || "HID Remapper"}. Press Send neutral or a button to write a report.`);
+        setStatus(`Connected to ${device.name || "HID Remapper"}. The first write may ask to pair so the BLE link can be encrypted.`);
     } catch (error) {
         setStatus(error.message || String(error));
     }
@@ -141,6 +157,11 @@ disconnectButton.addEventListener("click", () => {
     if (device?.gatt?.connected) {
         device.gatt.disconnect();
     }
+});
+
+pairButton.addEventListener("click", async () => {
+    report = neutralReport();
+    await queueCurrentReport();
 });
 
 document.querySelector("#neutral").addEventListener("click", async () => {
