@@ -52,19 +52,19 @@ tusb_desc_device_t desc_device = {
 
     .iManufacturer = 0x01,
     .iProduct = 0x02,
-    .iSerialNumber = 0x00,
+    .iSerialNumber = 0x03,
 
     .bNumConfigurations = 0x01,
 };
 
 const uint8_t configuration_descriptor0[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 2, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN, 0, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 2, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, our_descriptors[0].descriptor_length, 0x81, CFG_TUD_HID_EP_BUFSIZE, 1),
     TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_NONE, config_report_descriptor_length, 0x83, CFG_TUD_HID_EP_BUFSIZE, 1),
 };
 
 const uint8_t configuration_descriptor1[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 2, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN, 0, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 2, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, our_descriptors[1].descriptor_length, 0x81, CFG_TUD_HID_EP_BUFSIZE, 1),
     TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_NONE, config_report_descriptor_length, 0x83, CFG_TUD_HID_EP_BUFSIZE, 1),
 };
@@ -110,6 +110,7 @@ char const* string_desc_arr[] = {
     "RP2040",  // 1: Manufacturer
 #endif
     "HID Remapper XXXX",  // 2: Product
+    "123456789012",       // 3: Serial Number
 };
 
 // Invoked when received GET DEVICE DESCRIPTOR
@@ -179,6 +180,13 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
                 _desc_str[1 + chr_count - 4 + i] = id_chars[(unique_id >> (15 - i * 5)) & 0x1F];
             }
         }
+
+        if (index == 3) {
+            uint64_t unique_id = get_unique_id();
+            for (uint8_t i = 0; i < 12; i++) {
+                _desc_str[1 + i] = id_chars[(unique_id >> (55 - i * 5)) & 0x1F];
+            }
+        }
     }
 
     // first byte is length (including header), second byte is string type
@@ -219,4 +227,12 @@ void tud_mount_cb() {
         boot_protocol_keyboard = false;
         boot_protocol_updated = true;
     }
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    printf("tud_suspend_cb\n");
+}
+
+void tud_resume_cb() {
+    printf("tud_resume_cb\n");
 }
