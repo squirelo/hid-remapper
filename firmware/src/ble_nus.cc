@@ -167,7 +167,6 @@ static void nus_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* p
                 case GATTSERVICE_SUBEVENT_SPP_SERVICE_CONNECTED:
                     nus_conn = gattservice_subevent_spp_service_connected_get_con_handle(packet);
                     sm_request_pairing(nus_conn);
-                    gap_request_security_level(nus_conn, LEVEL_2);
                     break;
                 case GATTSERVICE_SUBEVENT_SPP_SERVICE_DISCONNECTED:
                     if (nus_conn == gattservice_subevent_spp_service_disconnected_get_con_handle(packet)) {

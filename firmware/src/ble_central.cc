@@ -351,7 +351,7 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t* pa
                 scanning = false;
             }
             break;
-        case GAP_EVENT_ADVERTISING_REPORT:
+        case GAP_EVENT_ADVERTISING_REPORT: {
             if (!scanning) {
                 return;
             }
@@ -364,11 +364,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t* pa
 
             bd_addr_t addr;
             gap_event_advertising_report_get_address(packet, addr);
-            bd_addr_type_t addr_type = gap_event_advertising_report_get_address_type(packet);
+            bd_addr_type_t addr_type = (bd_addr_type_t) gap_event_advertising_report_get_address_type(packet);
 
             scan_stop();
             gap_connect(addr, addr_type);
             break;
+        }
         case HCI_EVENT_LE_META:
             switch (hci_event_le_meta_get_subevent_code(packet)) {
                 case HCI_SUBEVENT_LE_CONNECTION_COMPLETE: {
@@ -390,12 +391,11 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t* pa
                     }
 
                     hci_subevent_le_connection_complete_get_peer_address(packet, slot->addr);
-                    slot->addr_type = hci_subevent_le_connection_complete_get_peer_address_type(packet);
+                    slot->addr_type = (bd_addr_type_t) hci_subevent_le_connection_complete_get_peer_address_type(packet);
 
                     scanning = false;
                     update_status_led();
                     sm_request_pairing(handle);
-                    gap_request_security_level(handle, LEVEL_2);
                     gap_request_connection_parameter_update(handle, 6, 9, 0, 400);
                     break;
                 }

@@ -28,6 +28,16 @@ Precompiled binaries are available for:
 
 To flash the [Pico firmware](firmware), hold the BOOTSEL button, plug the board into USB, and release BOOTSEL. A drive should appear on your computer. Copy the `remapper_bluetooth_pico_w.uf2` or `remapper_bluetooth_pico2_w.uf2` file from the [latest release](https://github.com/jfedor2/hid-remapper/releases/latest) to that drive.
 
+To build from source, initialize the Pico SDK nested submodules (BTstack, CYW43 driver, etc.) and Python 3 must be on your PATH (used to generate the GATT header):
+
+```bash
+git submodule update --init --recursive firmware/pico-sdk
+cd firmware && mkdir -p build-pico_w && cd build-pico_w
+PICO_BOARD=pico_w cmake .. && make remapper_bluetooth
+```
+
+For Pico 2 W, use `PICO_BOARD=pico2_w` instead.
+
 The Pico W boards do not have a built-in user button. To pair or clear bonds without the web configuration tool, short **GPIO 22** to GND: a short press starts pairing a new device, holding for more than 3 seconds clears all paired devices.
 
 To connect Bluetooth devices to the remapper, you need to put the device in pairing mode. This is device-specific, but usually involves holding a button for a few seconds. Then you also need to put HID Remapper in pairing mode. You do this by either pressing the "user switch" button on the board or by clicking the "Pair new device" button on the web configuration tool (the Xiao and Pico W boards don't have a user button so you have to either do it through the web interface or by shorting a GPIO pin to GND: pin 0 on the Xiao, GPIO 22 on the Pico W). The remapper will also automatically enter pairing mode if no devices are currently paired.

@@ -23,7 +23,7 @@ add_compile_options(-Wall)
 
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
 
-if((PICO_BOARD STREQUAL "pico") OR (PICO_BOARD STREQUAL "pico2"))
+if((PICO_BOARD STREQUAL "pico") OR (PICO_BOARD STREQUAL "pico2") OR (PICO_BOARD STREQUAL "pico_w") OR (PICO_BOARD STREQUAL "pico2_w"))
 add_compile_definitions(GPIO_VALID_PINS_BASE=0b00011100011111111111111111111111)
 endif()
 
@@ -185,6 +185,12 @@ target_link_libraries(remapper_serial
 pico_add_extra_outputs(remapper_serial)
 
 if((PICO_BOARD STREQUAL "pico_w") OR (PICO_BOARD STREQUAL "pico2_w"))
+set(BTSTACK_MARKER "${PICO_SDK_PATH}/lib/btstack/src/bluetooth.h")
+if(NOT EXISTS "${BTSTACK_MARKER}")
+    message(FATAL_ERROR
+        "BTstack is not initialized (missing ${BTSTACK_MARKER}).\n"
+        "Run: git submodule update --init --recursive firmware/pico-sdk")
+endif()
 add_executable(remapper_bluetooth
     src/main.cc
     src/remapper.cc
@@ -207,7 +213,7 @@ add_executable(remapper_bluetooth
 target_compile_definitions(remapper_bluetooth PUBLIC
     REMAPPER_BLUETOOTH=1
     CYW43_ENABLE_BLUETOOTH=1
-    PICO_FLASH_BANK_TOTAL_SIZE=(FLASH_SECTOR_SIZE*4)
+    PICO_FLASH_BANK_TOTAL_SIZE=16384
 )
 target_include_directories(remapper_bluetooth PRIVATE
     src
@@ -225,7 +231,7 @@ target_link_libraries(remapper_bluetooth
     tinyusb_board
     pico_btstack_ble
     pico_btstack_cyw43
-    pico_cyw43_arch_threadsafe_background
+    pico_cyw43_arch_none
 )
 pico_btstack_make_gatt_header(remapper_bluetooth PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/ble_remapper.gatt
