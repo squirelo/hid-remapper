@@ -1445,7 +1445,10 @@ bool send_report(send_report_t do_send_report) {
         sent = do_send_report(0, outgoing_reports[or_head], report_sizes[report_id] + 1);
     }
 
-    // XXX even if not sent?
+    if (!sent) {
+        return false;
+    }
+
     or_head = (or_head + 1) % OR_BUFSIZE;
     or_items--;
 

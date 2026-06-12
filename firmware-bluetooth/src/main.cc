@@ -1,5 +1,4 @@
-#include <errno.h>
-#include <stddef.h>
+#include <string.h>
 
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
@@ -23,12 +22,16 @@
 
 #include "config.h"
 #include "imu.h"
+#include "ble_hids.h"
 #include "descriptor_parser.h"
 #include "globals.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
 #include "crc.h"
+#include "slip_input.h"
+#include "usb_cdc_input.h"
+#include "virtual_input.h"
 
 LOG_MODULE_REGISTER(remapper, LOG_LEVEL_DBG);
 
@@ -40,24 +43,7 @@ static const uint16_t NUS_VIRTUAL_INTERFACE = 0x7f00;
 static const uint16_t NUS_VIRTUAL_VID = 0x0f0d;
 static const uint16_t NUS_VIRTUAL_PID = 0x00c1;
 
-static struct bt_uuid_128 nus_service_uuid = BT_UUID_INIT_128(
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-    0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
-
-static struct bt_uuid_128 nus_rx_uuid = BT_UUID_INIT_128(
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-    0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
-
-static struct bt_uuid_128 nus_tx_uuid = BT_UUID_INIT_128(
-    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-    0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
-
 #define NUS_PROTOCOL_VERSION 1
-#define NUS_PACKET_BUFFER_SIZE 512
-#define END 0300
-#define ESC 0333
-#define ESC_END 0334
-#define ESC_ESC 0335
 
 struct __attribute__((packed)) nus_packet_t {
     uint8_t protocol_version;
@@ -67,10 +53,6 @@ struct __attribute__((packed)) nus_packet_t {
     uint8_t data[0];
 };
 
-static uint8_t nus_packet_buffer[NUS_PACKET_BUFFER_SIZE];
-static uint16_t nus_bytes_read = 0;
-static bool nus_escaped = false;
-static bool nus_overflowed = false;
 static struct bt_conn* nus_conn;
 
 #define NUS_LATENCY_INSTRUMENTATION 1
@@ -137,16 +119,67 @@ K_MSGQ_DEFINE(disconnected_q, sizeof(struct disconnected_type), CONFIG_BT_MAX_CO
 K_MSGQ_DEFINE(set_report_q, sizeof(struct set_report_type), 8, 4);
 ATOMIC_DEFINE(tick_pending, 1);
 
-static void nus_start_advertising(void);
+static void peripheral_advertising_start(void);
 static void nus_init_virtual_device(void);
-static void nus_process_bytes(const uint8_t* data, uint16_t len);
+static void cdc_init_virtual_device(void);
+
+static void nus_optimize_connection(struct bt_conn* conn);
+static void nus_handle_packet(const uint8_t* data, uint16_t len);
+static void nus_slip_packet_handler(const uint8_t* data, uint16_t len, void* user_data);
+
+static struct bt_uuid_128 nus_service_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 nus_rx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e);
+
+static struct bt_uuid_128 nus_tx_uuid = BT_UUID_INIT_128(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
+
+void queue_virtual_hid_report(uint16_t interface, uint8_t report_id, const uint8_t* payload, uint8_t payload_len) {
+    struct report_type report = {
+        .interface = interface,
+        .external_report_id = report_id,
+        .len = payload_len,
+    };
+    memcpy(report.data, payload, payload_len);
+    if (k_msgq_put(&report_q, &report, K_NO_WAIT)) {
+        LOG_WRN("Dropped virtual report: report queue full");
+    }
+#if NUS_LATENCY_INSTRUMENTATION
+    else if (interface == NUS_VIRTUAL_INTERFACE) {
+        nus_rx_cycles = k_cycle_get_32();
+        nus_latency_pending = true;
+    }
+#endif
+}
 
 static ssize_t nus_rx_write_cb(struct bt_conn* conn, const struct bt_gatt_attr* attr,
                                const void* buf, uint16_t len, uint16_t offset, uint8_t flags) {
-    if (conn == nus_conn) {
-        nus_process_bytes((const uint8_t*) buf, len);
+    ARG_UNUSED(attr);
+    ARG_UNUSED(offset);
+    ARG_UNUSED(flags);
+
+    if (!nus_conn) {
+        nus_conn = bt_conn_ref(conn);
+        nus_optimize_connection(conn);
     }
+    if (conn != nus_conn) {
+        return len;
+    }
+
+    gpio_pin_set_dt(&led0, true);
+    k_work_reschedule(&activity_led_off_work, K_MSEC(50));
+    slip_input_process_bytes((const uint8_t*) buf, len, nus_slip_packet_handler, NULL);
     return len;
+}
+
+static void nus_slip_packet_handler(const uint8_t* data, uint16_t len, void* user_data) {
+    ARG_UNUSED(user_data);
+    nus_handle_packet(data, len);
 }
 
 static void nus_ccc_changed(const struct bt_gatt_attr* attr, uint16_t value) {
@@ -330,90 +363,19 @@ static void nus_handle_packet(const uint8_t* data, uint16_t len) {
                 msg->our_descriptor_number, our_descriptor_number);
     }
 
-    struct report_type report = {
-        .interface = NUS_VIRTUAL_INTERFACE,
-        .external_report_id = msg->report_id,
-        .len = (uint8_t) payload_len,
-    };
-    memcpy(report.data, msg->data, payload_len);
-    if (k_msgq_put(&report_q, &report, K_NO_WAIT)) {
-        LOG_WRN("Dropped NUS report: report queue full");
-    } else {
-#if NUS_LATENCY_INSTRUMENTATION
-        nus_rx_cycles = k_cycle_get_32();
-        nus_latency_pending = true;
-#endif
-    }
+    queue_virtual_hid_report(NUS_VIRTUAL_INTERFACE, msg->report_id, msg->data, (uint8_t) payload_len);
 }
 
-static void nus_packet_append(uint8_t c) {
-    if (nus_bytes_read >= sizeof(nus_packet_buffer)) {
-        if (!nus_overflowed) {
-            LOG_WRN("NUS packet too large; dropping until frame end");
-        }
-        nus_overflowed = true;
-        return;
-    }
-    nus_packet_buffer[nus_bytes_read++] = c;
+static void cdc_init_virtual_device(void) {
+    parse_descriptor(NUS_VIRTUAL_VID, NUS_VIRTUAL_PID,
+                     nus_virtual_gamepad_descriptor,
+                     sizeof(nus_virtual_gamepad_descriptor),
+                     CDC_VIRTUAL_INTERFACE, 0);
+    device_connected_callback(CDC_VIRTUAL_INTERFACE, NUS_VIRTUAL_VID, NUS_VIRTUAL_PID, 0);
+    their_descriptor_updated = true;
 }
 
-static void nus_process_byte(uint8_t c) {
-    if (nus_escaped) {
-        switch (c) {
-            case ESC_END:
-                nus_packet_append(END);
-                break;
-            case ESC_ESC:
-                nus_packet_append(ESC);
-                break;
-            default:
-                nus_packet_append(c);
-                break;
-        }
-        nus_escaped = false;
-        return;
-    }
-
-    switch (c) {
-        case END:
-            if (!nus_overflowed && (nus_bytes_read > 4)) {
-                uint32_t crc = crc32(nus_packet_buffer, nus_bytes_read - 4);
-                uint32_t received_crc =
-                    (nus_packet_buffer[nus_bytes_read - 4] << 0) |
-                    (nus_packet_buffer[nus_bytes_read - 3] << 8) |
-                    (nus_packet_buffer[nus_bytes_read - 2] << 16) |
-                    (nus_packet_buffer[nus_bytes_read - 1] << 24);
-                if (crc == received_crc) {
-                    nus_handle_packet(nus_packet_buffer, nus_bytes_read - 4);
-                } else {
-                    LOG_WRN("NUS CRC error: expected 0x%08X, got 0x%08X", crc, received_crc);
-                }
-            }
-            nus_bytes_read = 0;
-            nus_escaped = false;
-            nus_overflowed = false;
-            break;
-        case ESC:
-            if (!nus_overflowed) {
-                nus_escaped = true;
-            }
-            break;
-        default:
-            nus_packet_append(c);
-            break;
-    }
-}
-
-static void nus_process_bytes(const uint8_t* data, uint16_t len) {
-    gpio_pin_set_dt(&led0, true);
-    k_work_reschedule(&activity_led_off_work, K_MSEC(50));
-
-    for (uint16_t i = 0; i < len; i++) {
-        nus_process_byte(data[i]);
-    }
-}
-
-static void nus_start_advertising(void) {
+static void peripheral_advertising_start(void) {
     struct bt_le_adv_param adv_param = {
         .id = BT_ID_DEFAULT,
         .sid = 0,
@@ -426,9 +388,11 @@ static void nus_start_advertising(void) {
 
     static const struct bt_data ad[] = {
         BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_GAP_APPEARANCE, ((uint8_t[]){(uint8_t)(ble_hids_appearance() & 0xff), (uint8_t)(ble_hids_appearance() >> 8)}), 2),
+        BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL)),
         BT_DATA_BYTES(BT_DATA_UUID128_ALL,
-            0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-            0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e),
+                      0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                      0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e),
     };
 
     static const struct bt_data sd[] = {
@@ -440,7 +404,7 @@ static void nus_start_advertising(void) {
         LOG_ERR("bt_le_adv_start returned %d", err);
         return;
     }
-    LOG_INF("NUS advertising started.");
+    LOG_INF("Peripheral advertising started (NUS + HIDS).");
 }
 
 static void scan_start() {
@@ -685,14 +649,8 @@ static void connected(struct bt_conn* conn, uint8_t conn_err) {
     }
 
     if (info.role == BT_CONN_ROLE_PERIPHERAL) {
-        if (!nus_conn) {
-            nus_conn = bt_conn_ref(conn);
-            LOG_INF("NUS client connected: %s", addr);
-            CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
-        } else {
-            LOG_WRN("Rejecting extra NUS client: %s", addr);
-            CHK(bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN));
-        }
+        ble_hids_on_connected(conn);
+        CHK(bt_conn_set_security(conn, BT_SECURITY_L2));
         return;
     }
 
@@ -715,17 +673,17 @@ static void disconnected(struct bt_conn* conn, uint8_t reason) {
         LOG_INF("NUS client disconnected: %s (reason=%u)", addr, reason);
         bt_conn_unref(nus_conn);
         nus_conn = NULL;
-        nus_bytes_read = 0;
-        nus_escaped = false;
-        nus_overflowed = false;
+        slip_input_reset();
 #if NUS_LATENCY_INSTRUMENTATION
         nus_latency_pending = false;
 #endif
-        nus_start_advertising();
+        peripheral_advertising_start();
         return;
     }
     if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        ble_hids_on_disconnected(conn);
         LOG_INF("Peripheral client disconnected: %s (reason=%u)", addr, reason);
+        peripheral_advertising_start();
         return;
     }
 
@@ -783,6 +741,9 @@ static void security_changed(struct bt_conn* conn, bt_security_t level, enum bt_
     }
 
     if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        if (err) {
+            LOG_ERR("Peripheral security failed: level=%u, err=%d", level, err);
+        }
         return;
     }
 
@@ -1079,25 +1040,35 @@ static const struct hid_ops ops1 = {
 };
 
 static bool do_send_report(uint8_t interface, const uint8_t* report_with_id, uint8_t len) {
-    if (report_with_id[0] == 0) {
-        report_with_id++;
-        len--;
+    const uint8_t* payload = report_with_id;
+    uint8_t payload_len = len;
+
+    if (payload_len > 0 && payload[0] == 0) {
+        payload++;
+        payload_len--;
     }
+
     bool sent = false;
     if (interface == 0) {
-        sent = CHK(hid_int_ep_write(hid_dev0, report_with_id, len, NULL));
-    } else if (interface == 1) {
-        sent = CHK(hid_int_ep_write(hid_dev1, report_with_id, len, NULL));
-    }
-#if NUS_LATENCY_INSTRUMENTATION
-    if (sent && interface == 0 && nus_latency_pending) {
-        uint32_t delta = k_cycle_get_32() - nus_rx_cycles;
-        nus_latency_pending = false;
-        if ((nus_latency_samples++ & 0x3f) == 0) {
-            LOG_INF("NUS RX->USB latency: %u us", k_cyc_to_us_near32(delta));
+        if (k_sem_take(&usb_sem0, K_NO_WAIT) == 0) {
+            sent = CHK(hid_int_ep_write(hid_dev0, payload, payload_len, NULL)) || sent;
+            if (!sent) {
+                k_sem_give(&usb_sem0);
+            }
         }
-    }
+        sent = ble_hids_try_send_report(report_with_id, len) || sent;
+#if NUS_LATENCY_INSTRUMENTATION
+        if (sent && nus_latency_pending) {
+            uint32_t delta = k_cycle_get_32() - nus_rx_cycles;
+            nus_latency_pending = false;
+            if ((nus_latency_samples++ & 0x3f) == 0) {
+                LOG_INF("NUS RX->output latency: %u us", k_cyc_to_us_near32(delta));
+            }
+        }
 #endif
+    } else if (interface == 1) {
+        sent = CHK(hid_int_ep_write(hid_dev1, payload, payload_len, NULL));
+    }
     return sent;
 }
 
@@ -1170,6 +1141,7 @@ static void usb_init() {
     CHK(usb_hid_init(hid_dev0));
     CHK(usb_hid_init(hid_dev1));
     CHK(usb_enable(status_cb));
+    usb_cdc_input_init();
 }
 
 static void bt_init() {
@@ -1295,11 +1267,13 @@ int main() {
     usb_init();
     scan_init();
     parse_our_descriptor();
+    ble_hids_init();
     set_mapping_from_config();
     nus_init_virtual_device();
+    cdc_init_virtual_device();
     update_their_descriptor_derivates();
     their_descriptor_updated = false;
-    nus_start_advertising();
+    peripheral_advertising_start();
 
     // Initialize 6-axis IMU AFTER mapping system is ready
 #if DT_NODE_EXISTS(DT_NODELABEL(lsm6ds3tr_c))
@@ -1335,16 +1309,16 @@ int main() {
             process_mapping(true);
             process_pending = false;
         }
-        if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
-            if (!send_report(do_send_report)) {
-                k_sem_give(&usb_sem0);
-            }
+        if (!send_report(do_send_report)) {
+            // Backpressure until USB or BLE accepts the report.
         }
         if (!k_sem_take(&usb_sem1, K_NO_WAIT)) {
             if (!send_monitor_report(do_send_report)) {
                 k_sem_give(&usb_sem1);
             }
         }
+
+        usb_cdc_input_poll();
 
         if (!k_msgq_get(&set_report_q, &set_report_item, K_NO_WAIT)) {
             if (set_report_item.interface == 0) {

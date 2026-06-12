@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 set(BOARD_ROOT ${CMAKE_CURRENT_LIST_DIR})
+set(DTC_OVERLAY_FILE ${CMAKE_CURRENT_LIST_DIR}/usb_composite.overlay)
 
 add_compile_definitions(PERSISTED_CONFIG_SIZE=2048)
 
@@ -9,11 +10,15 @@ project(NONE)
 
 set(REMAPPER_SRC ../firmware/src)
 
-target_include_directories(app PRIVATE ${REMAPPER_SRC})
+target_include_directories(app PRIVATE ${REMAPPER_SRC} src)
 
 target_sources(app PRIVATE
     src/main.cc
     src/imu.cc
+    src/slip_input.cc
+    src/ble_hids.cc
+    src/ble_hids_obj.c
+    src/usb_cdc_input.cc
     ${REMAPPER_SRC}/config.cc
     ${REMAPPER_SRC}/crc.cc
     ${REMAPPER_SRC}/descriptor_parser.cc

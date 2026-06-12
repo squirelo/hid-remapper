@@ -23,6 +23,7 @@ const usages = {
         "0x00010031": { 'name': 'Left stick Y', 'class': 'gamepad' },
         "0x00010032": { 'name': 'Right stick X', 'class': 'gamepad' },
         "0x00010035": { 'name': 'Right stick Y', 'class': 'gamepad' },
+        "0x00010039": { 'name': 'Hat switch', 'class': 'gamepad' },
         "0xfff90001": { 'name': 'D-pad left', 'class': 'gamepad' },
         "0xfff90002": { 'name': 'D-pad right', 'class': 'gamepad' },
         "0xfff90003": { 'name': 'D-pad up', 'class': 'gamepad' },

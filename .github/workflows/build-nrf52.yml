@@ -23,7 +23,7 @@ jobs:
             extra_args: ""
           - board: "seeed_xiao_nrf52840"
             name: "seeed_xiao_nrf52840_sense"
-            extra_args: "-- \"-DOVERLAY_CONFIG=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.conf\" \"-DDTC_OVERLAY_FILE=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.overlay\""
+            extra_args: "-- \"-DOVERLAY_CONFIG=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.conf\" \"-DDTC_OVERLAY_FILE=boards/arm/seeed_xiao_nrf52840/seeed_xiao_nrf52840_sense.overlay;usb_composite.overlay\""
     steps:
       - uses: actions/checkout@v6
       - name: Build

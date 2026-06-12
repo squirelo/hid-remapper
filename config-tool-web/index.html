@@ -37,6 +37,7 @@
         <div class="nav nav-tabs" id="nav-tab" role="tablist">
             <button class="nav-link active" id="nav-mappings-tab" data-bs-toggle="tab" data-bs-target="#nav-mappings" type="button" role="tab">Mappings</button>
             <button class="nav-link" id="nav-settings-tab" data-bs-toggle="tab" data-bs-target="#nav-settings" type="button" role="tab">Settings</button>
+            <button class="nav-link" id="nav-io-tab" data-bs-toggle="tab" data-bs-target="#nav-io" type="button" role="tab">I/O</button>
             <button class="nav-link" id="nav-macros-tab" data-bs-toggle="tab" data-bs-target="#nav-macros" type="button" role="tab">Macros</button>
             <button class="nav-link" id="nav-expressions-tab" data-bs-toggle="tab" data-bs-target="#nav-expressions" type="button" role="tab">Expressions</button>
             <button class="nav-link" id="nav-actions-tab" data-bs-toggle="tab" data-bs-target="#nav-actions" type="button" role="tab">Actions</button>
@@ -297,6 +298,138 @@
                 </div>
             </div>
 
+            <div class="tab-pane" id="nav-io" role="tabpanel" tabindex="0">
+
+                <p class="mt-4">Input and output paths on the Bluetooth firmware. USB-only remappers expose USB HID output below.</p>
+
+                <div class="row mt-3 fw-bold d-none d-md-flex">
+                    <div class="col-3">Route</div>
+                    <div class="col-2">Direction</div>
+                    <div class="col-2">Transport</div>
+                    <div class="col-5">How to use</div>
+                </div>
+
+                <div class="row mt-2 py-2 border-bottom io-bluetooth-only">
+                    <div class="col-md-3"><strong>BLE HID devices</strong></div>
+                    <div class="col-md-2"><span class="badge bg-info">Input</span></div>
+                    <div class="col-md-2">BLE central</div>
+                    <div class="col-md-5">Pair with the button below or the board's user switch.</div>
+                </div>
+                <div class="row mt-2 py-2 border-bottom io-bluetooth-only">
+                    <div class="col-md-3"><strong>Virtual gamepad (BLE)</strong></div>
+                    <div class="col-md-2"><span class="badge bg-info">Input</span></div>
+                    <div class="col-md-2">BLE NUS + SLIP</div>
+                    <div class="col-md-5">Use the NUS tester below to send virtual HID reports.</div>
+                </div>
+                <div class="row mt-2 py-2 border-bottom io-bluetooth-only">
+                    <div class="col-md-3"><strong>Virtual gamepad (serial)</strong></div>
+                    <div class="col-md-2"><span class="badge bg-info">Input</span></div>
+                    <div class="col-md-2">USB CDC + SLIP</div>
+                    <div class="col-md-5"><code>firmware-bluetooth/scripts/cdc_hid_send.py</code></div>
+                </div>
+                <div class="row mt-2 py-2 border-bottom io-bluetooth-only">
+                    <div class="col-md-3"><strong>MIDI</strong></div>
+                    <div class="col-md-2"><span class="badge bg-info">Input</span></div>
+                    <div class="col-md-2">USB MIDI</div>
+                    <div class="col-md-5">Map MIDI usages in the Mappings tab (iOS USB).</div>
+                </div>
+                <div class="row mt-2 py-2 border-bottom">
+                    <div class="col-md-3"><strong>USB HID</strong></div>
+                    <div class="col-md-2"><span class="badge bg-success">Output</span></div>
+                    <div class="col-md-2">USB interface 0</div>
+                    <div class="col-md-5">Emulated device type in Settings.</div>
+                </div>
+                <div class="row mt-2 py-2 border-bottom io-bluetooth-only">
+                    <div class="col-md-3"><strong>BLE HID host</strong></div>
+                    <div class="col-md-2"><span class="badge bg-success">Output</span></div>
+                    <div class="col-md-2">BLE HIDS 0x1812</div>
+                    <div class="col-md-5">Pair from the host OS Bluetooth settings (PC, tablet, phone).</div>
+                </div>
+
+                <div class="row mt-4 io-bluetooth-only" id="io_ble_central_actions">
+                    <div class="col-4 d-none" id="pair_new_device_container">
+                        <button id="pair_new_device" type="button" class="btn btn-primary w-100">Pair new device</button>
+                    </div>
+                    <div class="col-4 d-none" id="clear_bonds_container">
+                        <button id="clear_bonds" type="button" class="btn btn-primary w-100">Forget all devices</button>
+                    </div>
+                </div>
+
+                <div class="card mt-4 io-bluetooth-only" id="nus_tester_card">
+                    <div class="card-header">BLE NUS virtual gamepad tester</div>
+                    <div class="card-body">
+                        <p class="text-muted small">Uses Web Bluetooth separately from the USB config connection. The first write may prompt for pairing so the link can be encrypted.</p>
+                        <div id="nus_tester_unavailable" class="alert alert-warning d-none">Web Bluetooth is not available in this browser. Try Chrome (desktop) or another Chromium-based browser.</div>
+                        <div id="nus_tester_controls">
+                            <div class="row g-2 mb-3">
+                                <div class="col-auto">
+                                    <button id="nus_connect" type="button" class="btn btn-primary">Connect</button>
+                                </div>
+                                <div class="col-auto">
+                                    <button id="nus_connect_filtered" type="button" class="btn btn-primary">Connect by NUS UUID</button>
+                                </div>
+                                <div class="col-auto">
+                                    <button id="nus_pair" type="button" class="btn btn-primary" disabled>Pair / test write</button>
+                                </div>
+                                <div class="col-auto">
+                                    <button id="nus_disconnect" type="button" class="btn btn-primary" disabled>Disconnect</button>
+                                </div>
+                                <div class="col-auto">
+                                    <label class="col-form-label" for="nus_descriptor">Descriptor</label>
+                                    <select class="form-select d-inline-block w-auto" id="nus_descriptor">
+                                        <option value="0">0</option>
+                                        <option value="1">1</option>
+                                        <option value="2">2</option>
+                                        <option value="3">3</option>
+                                        <option value="4">4</option>
+                                        <option value="5">5</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div id="nus_status" class="alert alert-secondary py-2">Disconnected.</div>
+                            <h6 class="mt-3">Buttons</h6>
+                            <div class="row g-2 mb-2">
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="0">A</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="1">B</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="2">X</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="3">Y</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="4">L1</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-button" data-button="5">R1</button></div>
+                                <div class="col-auto"><button id="nus_neutral" type="button" class="btn btn-outline-secondary">Send neutral</button></div>
+                            </div>
+                            <h6 class="mt-3">D-pad</h6>
+                            <div class="row g-2 mb-2">
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-hat" data-hat="0">Up</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-hat" data-hat="2">Right</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-hat" data-hat="4">Down</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-hat" data-hat="6">Left</button></div>
+                                <div class="col-auto"><button type="button" class="btn btn-outline-primary nus-hat" data-hat="15">Center</button></div>
+                            </div>
+                            <h6 class="mt-3">Axes</h6>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label for="nus_axis_x" class="form-label">X</label>
+                                    <input id="nus_axis_x" type="range" class="form-range" min="0" max="255" value="128">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="nus_axis_y" class="form-label">Y</label>
+                                    <input id="nus_axis_y" type="range" class="form-range" min="0" max="255" value="128">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="nus_axis_z" class="form-label">Z</label>
+                                    <input id="nus_axis_z" type="range" class="form-range" min="0" max="255" value="128">
+                                </div>
+                                <div class="col-md-6">
+                                    <label for="nus_axis_rz" class="form-label">Rz</label>
+                                    <input id="nus_axis_rz" type="range" class="form-range" min="0" max="255" value="128">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
             <div class="tab-pane" id="nav-macros" role="tabpanel" tabindex="0">
 
                 <div class="accordion mt-4" id="macros_container">
@@ -333,15 +466,6 @@
                     </div>
                     <div class="col-4" id="flash_b_side_container">
                         <button id="flash_b_side" type="button" class="btn btn-primary w-100">Flash B side</button>
-                    </div>
-                </div>
-
-                <div class="row mt-4">
-                    <div class="col-4 d-none" id="pair_new_device_container">
-                        <button id="pair_new_device" type="button" class="btn btn-primary w-100">Pair new device</button>
-                    </div>
-                    <div class="col-4 d-none" id="clear_bonds_container">
-                        <button id="clear_bonds" type="button" class="btn btn-primary w-100">Forget all devices</button>
                     </div>
                 </div>
 

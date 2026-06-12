@@ -1,6 +1,7 @@
 import crc32 from './crc.js';
 import usages from './usages.js';
 import examples from './examples.js';
+import { initNusTester } from './nus-tester.js';
 
 const REPORT_ID_CONFIG = 100;
 const REPORT_ID_MONITOR = 101;
@@ -238,6 +239,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
     setup_examples();
+    initNusTester();
     source_modal = new bootstrap.Modal(document.getElementById('source_usage_modal'), {});
     target_modal = new bootstrap.Modal(document.getElementById('target_usage_modal'), {});
     setup_macros();
@@ -1535,6 +1537,7 @@ function hid_on_disconnect(event) {
     if (event.device === device) {
         device = null;
         device_buttons_set_disabled_state(true);
+        bluetooth_buttons_set_visibility(false);
     }
 }
 
@@ -1551,6 +1554,10 @@ function bluetooth_buttons_set_visibility(visible) {
     document.getElementById("pair_new_device_container").classList.toggle("d-none", !visible);
     document.getElementById("clear_bonds_container").classList.toggle("d-none", !visible);
     document.getElementById("flash_b_side_container").classList.toggle("d-none", visible);
+    const showBluetoothOnly = device == null || visible;
+    document.querySelectorAll(".io-bluetooth-only").forEach((el) => {
+        el.classList.toggle("d-none", !showBluetoothOnly);
+    });
 }
 
 function mask_to_layer_list(layer_mask) {
