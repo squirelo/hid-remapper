@@ -17,6 +17,7 @@ Precompiled binaries are available for:
 * [Adafruit Feather nRF52840 Express](https://www.adafruit.com/product/4062)
 * [Seeed Studio Xiao nRF52840](https://www.seeedstudio.com/Seeed-XIAO-BLE-nRF52840-p-5201.html)
 * [Seeed Studio Xiao nRF52840 Sense](https://www.seeedstudio.com/Seeed-XIAO-BLE-Sense-nRF52840-p-5251.html)
+* [Arduino Nano 33 BLE Sense](https://store.arduino.cc/products/arduino-nano-33-ble-sense)
 
 To flash the [nRF firmware](firmware-bluetooth) on Adafruit Feather or Seeed Xiao boards, first put the board in flashing mode by double clicking the reset button quickly. A drive should appear on your computer. Copy the [UF2 file that matches your board](https://github.com/jfedor2/hid-remapper/releases/latest) to that drive and that's it. If you want to flash a newer version of the firmware in the future, you can also put the board in firmware flashing mode using the HID Remapper [web configuration tool](https://www.remapper.org/config/).
 
@@ -39,11 +40,59 @@ For local Xiao nRF52840 Sense builds on Windows:
 
 Flash `firmware-bluetooth\build-xiao-sense\zephyr\remapper.uf2` by double tapping reset and copying it to the UF2 drive.
 
-To connect Bluetooth devices to the remapper, put the device in pairing mode, then put HID Remapper in pairing mode by pressing the user switch button or clicking **Pair new device** in the web configuration tool (on Seeed Xiao, short pin 0 to GND: short press to pair, hold > 3 s to forget all). The remapper automatically enters pairing mode if no devices are paired.
+## Physical GPIO
+
+The Xiao nRF52840 and Arduino Nano 33 BLE Sense builds support digital GPIO mappings with the same behavior as the RP2040 firmware:
+
+* inputs are active low with internal pull-ups and use the configured GPIO debounce time
+* a pin used as both an input and an output is treated as an input
+* all available pins not used as outputs are monitored as inputs
+* outputs support both **0=low, 1=high** and **0=high impedance, 1=low** modes
+
+The `GPIO N` names in the configuration tool refer to the labels printed on each board:
+
+| Board | Available GPIO usages | Physical header labels |
+| ----- | --------------------- | ---------------------- |
+| Xiao nRF52840 / Sense | GPIO 1-GPIO 10 | D1-D10 |
+| Arduino Nano 33 BLE Sense | GPIO 0-GPIO 1, GPIO 3-GPIO 21 | D0-D1, D3-D13, A0-A7 |
+
+On the Nano, GPIO 14-GPIO 21 correspond to A0-A7 used as digital pins. Xiao D0/GPIO 0 and Nano D2/GPIO 2 remain reserved for the pairing/clear-bonds input. Nano D13/GPIO 13 is also connected to the board's built-in yellow LED.
+
+These are 3.3 V GPIOs and are not 5 V tolerant.
+
+## MoveStick onboard sensor input
+
+The sensor-enabled Bluetooth builds can use the board itself as an input device. After flashing a sensor build, open the web configuration tool, use the **Sensors** tab to enable onboard sensors, save the configuration, and re-plug the board. The sensor inputs then appear in the mapping UI and monitor like other HID inputs.
+
+Supported sensor boards:
+
+| Board | Sensors exposed by the firmware |
+| ----- | -------------------------------- |
+| Seeed Studio Xiao nRF52840 Sense | 6DoF motion, twist/leaky yaw, shake, microphone level |
+| Arduino Nano 33 BLE Sense | 9DoF motion with absolute yaw, shake, microphone level, APDS9960 proximity/light/gesture inputs |
+
+Motion inputs include **Pitch**, **Roll**, **Shake**, **Leaky Relative Yaw**, **Twist Rate**, and **Yaw** on 9DoF boards with a magnetometer. The Xiao Sense does not have absolute yaw; for that board, startup or **Recenter IMU** defines the current direction as zero, and **Leaky Relative Yaw** integrates twist motion from that point while gradually returning to zero.
+
+The **Sensors** tab lets you:
+
+* enable or disable onboard sensors
+* recenter, pause, and resume IMU input
+* set motion filter size from 1 sample for faster response to 16 samples for steadier output
+* set pitch, roll, and yaw deadzones and separate positive/negative max angles
+* invert pitch, roll, yaw, and twist directions
+* tune twist deadzone, twist max rate, and leaky-yaw return time
+
+Additional APDS9960 inputs are available on boards that have that sensor: **Proximity**, **Ambient Light**, **Gesture X**, **Gesture Y**, **Gesture Strength**, **Gesture Up**, **Gesture Down**, **Gesture Left**, **Gesture Right**, **Near**, and **Covered**.
+
+The firmware also exposes mapping actions for **Recenter IMU**, **Pause IMU**, and **Resume IMU**, so buttons, BLE controller inputs, or expressions can control the motion input at runtime.
+
+The **Examples** tab includes **IMU mouse control** and **IMU Switch gamepad** presets that can be imported as starting points.
+
+To connect Bluetooth devices to the remapper, put the device in pairing mode, then put HID Remapper in pairing mode by pressing the user switch button or clicking **Pair new device** in the web configuration tool. On Seeed Xiao, short D0 to GND; on Arduino Nano 33 BLE Sense, short D2 to GND. A short press starts pairing and holding for more than 3 seconds forgets all devices. The remapper automatically enters pairing mode if no devices are paired.
 
 You can tell the remapper is in pairing mode if the onboard LED is lit constantly. When it's not in pairing mode, the LED blinks, with the number of blinks per cycle corresponding to the number of currently connected devices.
 
-To make the remapper forget all currently paired devices, hold the user switch button for over 3 seconds, or click **Forget all devices** in the web configuration tool (or short the pairing pin to GND for over 3 seconds on the Seeed Xiao).
+To make the remapper forget all currently paired devices, hold the user switch button for over 3 seconds, click **Forget all devices** in the web configuration tool, or short the board's pairing pin to GND for over 3 seconds.
 
 ### Raspberry Pi Pico W / Pico 2 W (NUS only)
 
@@ -117,7 +166,7 @@ If you click **Pair new device** and the LED **keeps blinking** instead of going
 
 ### Stale bonds
 
-If a previous pairing attempt failed or the controller address changed (common with Xbox controllers in Sync pairing mode), use **Forget all devices** in the web tool, or hold the pairing pin to GND for more than 3 seconds on the Seeed Xiao.
+If a previous pairing attempt failed or the controller address changed (common with Xbox controllers in Sync pairing mode), use **Forget all devices** in the web tool, or hold the board's pairing pin to GND for more than 3 seconds.
 
 ### Xbox controller (Bluetooth LE mode)
 

@@ -14,7 +14,17 @@ In addition to the remapping functionality, it can do polling rate overclocking 
 
 A separate [serial](SERIAL.md) version of the remapper takes inputs from a serial (RS-232) mouse and translates them to USB.
 
-There's also a [Bluetooth](BLUETOOTH.md) version that runs on nRF52840-based boards, which translates Bluetooth inputs to USB.
+There's also a [Bluetooth](BLUETOOTH.md) version that runs on nRF52840-based boards and Raspberry Pi Pico W / Pico 2 W, which translates Bluetooth inputs to USB.
+
+## MoveStick and onboard sensors
+
+The Bluetooth firmware can also be used as MoveStick firmware on boards with onboard sensors, currently Seeed Studio Xiao nRF52840 Sense and Arduino Nano 33 BLE Sense. These builds expose the board's sensors as normal HID inputs, so they can be mapped to mouse, keyboard, gamepad, macro, expression, or layer outputs like any other input.
+
+New sensor inputs include pitch, roll, shake, microphone level, leaky relative yaw, twist rate, and, on supported 9DoF hardware, absolute yaw. Boards with an APDS9960 sensor also expose proximity, ambient light, gesture X/Y, gesture strength, gesture up/down/left/right, near, and covered inputs.
+
+The web configuration tool has a **Sensors** tab for enabling onboard sensors, recentering, pausing and resuming IMU input, setting the motion filter, configuring per-axis deadzones and max angles, inverting roll/pitch/yaw, and tuning twist and leaky-yaw behavior.
+
+The **Bluetooth** tab can pair and forget BLE HID controllers, list paired and connected BLE HID/NUS devices, and run the Web Bluetooth NUS tester for virtual gamepad input. See [BLUETOOTH.md](BLUETOOTH.md) for flashing, pairing, NUS, and sensor details.
 
 ![HID Remapper](images/remapper1.jpg)
 
@@ -60,6 +70,9 @@ custom board v8 | [remapper\_board\_v8.uf2](https://github.com/jfedor2/hid-remap
 Feather nRF52840 Express | [remapper_adafruit_feather_nrf52840.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_adafruit_feather_nrf52840.uf2) |
 Xiao nRF52840 | [remapper_seeed_xiao_nrf52840.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_seeed_xiao_nrf52840.uf2) |
 Xiao nRF52840 Sense | [remapper_seeed_xiao_nrf52840_sense.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_seeed_xiao_nrf52840_sense.uf2) |
+Arduino Nano 33 BLE Sense | [remapper_arduino_nano_33_ble_sense.bin](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_arduino_nano_33_ble_sense.bin) | flash with Arduino's `bossac` bootloader tool
+Raspberry Pi Pico W | [remapper_bluetooth_pico_w.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_bluetooth_pico_w.uf2) | Bluetooth NUS virtual input only
+Raspberry Pi Pico 2 W | [remapper_bluetooth_pico2_w.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_bluetooth_pico2_w.uf2) | Bluetooth NUS virtual input only
 serial | [remapper_serial.uf2](https://github.com/jfedor2/hid-remapper/releases/latest/download/remapper_serial.uf2) |
 
 For boards not listed above, use the same file name you used when flashing it for the first time.

@@ -16,6 +16,12 @@
 	};
 };
 
+/* The onboard sensors use i2c1. Leave the header A4/A5 pins available as
+ * logical GPIO 18/19 instead of claiming them for the unused external bus. */
+&i2c0 {
+	status = "disabled";
+};
+
 &i2c1 {
 	status = "okay";
 	clock-frequency = <I2C_BITRATE_FAST>;

@@ -10,12 +10,11 @@ CONFIG_ARM_MPU=y
 # enable GPIO
 CONFIG_GPIO=y
 
-# enable uart driver
-CONFIG_SERIAL=y
-
-# enable console
-CONFIG_CONSOLE=y
-CONFIG_UART_CONSOLE=y
+# Keep D6/D7 available as physical GPIO instead of claiming them for logging.
+CONFIG_SERIAL=n
+CONFIG_CONSOLE=n
+CONFIG_UART_CONSOLE=n
+CONFIG_LOG_BACKEND_UART=n
 
 # additional board options
 CONFIG_GPIO_AS_PINRESET=y

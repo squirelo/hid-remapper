@@ -78,7 +78,7 @@
 
 &i2c0 {
 	compatible = "nordic,nrf-twi";
-	status = "okay";
+	status = "disabled";
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";

@@ -26,6 +26,7 @@
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "gpio.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -1323,13 +1324,11 @@ void queue_get_feature_report(uint16_t interface, uint8_t report_id, uint8_t len
     // TODO
 }
 
-void set_gpio_inout_masks(uint32_t in_mask, uint32_t out_mask) {
-}
-
 int main() {
     LOG_INF("HID Remapper Bluetooth");
 
     my_mutexes_init();
+    gpio_pins_init();
     button_init();
     leds_init();
     
@@ -1385,7 +1384,9 @@ int main() {
             process_pending = true;
         }
         if (atomic_test_and_clear_bit(tick_pending, 0)) {
+            read_gpio(get_time());
             process_mapping(true);
+            write_gpio();
             process_pending = false;
         }
         if (!k_sem_take(&usb_sem0, K_NO_WAIT)) {
@@ -1437,6 +1438,7 @@ int main() {
             set_mapping_from_config();
             config_updated = false;
         }
+        apply_pending_gpio_direction();
 
         if (their_descriptor_updated) {
             update_their_descriptor_derivates();

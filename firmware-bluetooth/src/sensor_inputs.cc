@@ -455,9 +455,21 @@ static float compute_tilt_compensated_yaw_rate(float roll, float pitch, float gy
 
 static void update_leaky_relative_yaw(float yaw_rate_dps, float dt) {
     leaky_relative_yaw = motion_fusion_wrap_angle_180(leaky_relative_yaw + yaw_rate_dps * dt);
+    leaky_relative_yaw = clamp_angle_to_limits(leaky_relative_yaw, imu_yaw_neg_max_angle, imu_yaw_pos_max_angle);
 
     if (imu_yaw_leak_time > 0) {
-        leaky_relative_yaw *= expf(-dt / (float)imu_yaw_leak_time);
+        float yaw_range = (leaky_relative_yaw >= 0.0f) ?
+            (float)sanitize_angle_limit(imu_yaw_pos_max_angle) :
+            (float)sanitize_angle_limit(imu_yaw_neg_max_angle);
+        float return_step = yaw_range * dt / (float)imu_yaw_leak_time;
+
+        if (fabsf(leaky_relative_yaw) <= return_step) {
+            leaky_relative_yaw = 0.0f;
+        } else if (leaky_relative_yaw > 0.0f) {
+            leaky_relative_yaw -= return_step;
+        } else {
+            leaky_relative_yaw += return_step;
+        }
     }
 }
 
