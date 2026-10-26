@@ -35,6 +35,7 @@ extern "C" {
 #include "config.h"
 #include "descriptor_parser.h"
 #include "globals.h"
+#include "joycon.h"
 #include "our_descriptor.h"
 #include "platform.h"
 #include "remapper.h"
@@ -710,10 +711,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     uint8_t slot = bond_slot_for_addr(device_addr[idx]);
                     BT_LOG("connected to %s as device %d (bond slot %d, %s)", bd_addr_to_str(addr), idx, slot,
                         is_bonded(addr) ? "bonded" : "NOT bonded - device did not pair, won't reconnect");
-                    // VID/PID reported as 1/1 like the nRF variant; real values
-                    // would need a separate Device ID SDP query (only matters
-                    // for device-specific quirks, which this variant has none of).
-                    device_connected_callback(idx << 8, 1, 1, slot);
+                    // Register the input once the descriptor is available;
+                    // Joy-Con halves may instead join a single virtual input.
                     break;
                 }
 
@@ -731,7 +730,11 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     const uint8_t* desc = hid_descriptor_storage_get_descriptor_data(cid);
                     uint16_t desc_len = hid_descriptor_storage_get_descriptor_len(cid);
                     BT_LOG("device %d: HID descriptor available, %u bytes", idx, desc_len);
-                    parse_descriptor(1, 1, desc, desc_len, idx << 8, 0);
+                    uint8_t port = bond_slot_for_addr(device_addr[idx]);
+                    if (!joycon_attach(cid, idx << 8, port, desc, desc_len)) {
+                        device_connected_callback(idx << 8, 1, 1, port);
+                        parse_descriptor(1, 1, desc, desc_len, idx << 8, 0);
+                    }
                     device_ready[idx] = true;
                     break;
                 }
@@ -762,7 +765,17 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     int idx = index_for_cid(cid, false);
                     if (idx >= 0) {
                         BT_LOG("device %d (%s) disconnected", idx, bd_addr_to_str(device_addr[idx]));
-                        device_disconnected_callback(idx);
+                        // Invalidate buffered reports before this slot can be
+                        // reused, including reports from a departing Joy-Con.
+                        for (uint16_t pos = report_ring_head; pos != report_ring_tail; pos++) {
+                            auto& queued = report_ring[pos % REPORT_RING_SIZE];
+                            if (queued.interface == (idx << 8)) {
+                                queued.len = 0;
+                            }
+                        }
+                        if (!joycon_detach(idx << 8)) {
+                            device_disconnected_callback(idx);
+                        }
                         free_index(idx);
                     }
                     break;
@@ -800,7 +813,9 @@ void read_report(bool* new_report, bool* tick) {
     }
     if (report_ring_head != report_ring_tail) {
         queued_report_t* slot = &report_ring[report_ring_head % REPORT_RING_SIZE];
-        handle_received_report(slot->data, slot->len, slot->interface);
+        if (slot->len && !joycon_report(slot->interface, slot->data, slot->len)) {
+            handle_received_report(slot->data, slot->len, slot->interface);
+        }
         report_ring_head++;
         *new_report = true;
         report_processing_pending = true;
@@ -902,15 +917,16 @@ int main() {
 
     while (true) {
         cyw43_arch_poll();
-
-        bool tick;
-        bool new_report;
-        read_report(&new_report, &tick);
+        joycon_task();
 
         if (their_descriptor_updated) {
             update_their_descriptor_derivates();
             their_descriptor_updated = false;
         }
+
+        bool tick;
+        bool new_report;
+        read_report(&new_report, &tick);
 
         if (tick) {
             process_mapping(true);

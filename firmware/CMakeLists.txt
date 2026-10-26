@@ -219,6 +219,7 @@ if(PICO_CYW43_SUPPORTED)
 add_executable(remapper_bt
     src/main_bt.cc
     src/main_bt_usb.cc
+    src/joycon.cc
     src/remapper.cc
     src/crc.cc
     src/descriptor_parser.cc
